@@ -6,6 +6,7 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path as FilePath
 from typing import Any
 
 import httpx
@@ -16,6 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
+
+BASE_DIR = FilePath(__file__).resolve().parent
+ROOT_DIR = BASE_DIR.parent
+
+# Load environment before importing modules that read keys at import time.
+load_dotenv(ROOT_DIR / ".env.local")
+load_dotenv(ROOT_DIR / ".env")
 
 from ai_analyzer import analyze_stock_with_gemini
 from data_collectors import (
@@ -29,9 +37,6 @@ from data_collectors import (
     yfinance_fundamentals,
 )
 from pdf_generator import generate_pdf_bytes
-
-
-load_dotenv()
 
 app = FastAPI(title="AlphaDesk API", version="1.0.0")
 
@@ -324,8 +329,15 @@ async def run_research_pipeline(symbol: str) -> dict:
         sector_news=sector_news,
     )
 
+    catalyst_analysis = ai_result.get("catalyst_analysis") if isinstance(ai_result.get("catalyst_analysis"), dict) else {}
+    fundamental_analysis = ai_result.get("fundamental_analysis") if isinstance(ai_result.get("fundamental_analysis"), dict) else {}
+
     unified = {
         **ai_result,
+        # Flatten key fields for frontend/API consumers expecting top-level values.
+        "catalyst_type": catalyst_analysis.get("catalyst_type"),
+        "rating": fundamental_analysis.get("rating"),
+        "target_price": fundamental_analysis.get("target_price"),
         "generated_at": _now_utc().isoformat(),
         "cache": {"status": "miss", "age_minutes": 0},
         "inputs": {
