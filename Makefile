@@ -1,5 +1,5 @@
 start-backend:
-	cd backend && source venv/bin/activate && uvicorn main:app --reload --port 8000 --host 0.0.0.0
+	cd backend && ./venv/bin/python -m uvicorn main:app --reload --port 8000 --host 0.0.0.0
 
 start-frontend:
 	cd frontend && npm run dev -- --port 3000 --hostname 0.0.0.0
