@@ -1,11 +1,112 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { UploadCloud } from "lucide-react";
+import { useRouter } from "next/navigation";
+
+import { useAlphaStore } from "../src/store/useAlphaStore";
+
+type OcrResponse = {
+  symbols?: string[];
+};
 
 export default function Home() {
-  const [symbols, setSymbols] = useState("");
+  const router = useRouter();
+  const setSymbols = useAlphaStore((s) => s.setSymbols);
+  const clearAll = useAlphaStore((s) => s.clearAll);
+
+  const [manualSymbols, setManualSymbols] = useState("");
   const [selectedFileName, setSelectedFileName] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const applySelectedFile = (file: File | null) => {
+    if (!file) {
+      setSelectedFile(null);
+      setSelectedFileName("");
+      return;
+    }
+
+    setSelectedFile(file);
+    setSelectedFileName(file.name || "pasted-watchlist.png");
+    setErrorMessage("");
+  };
+
+  const handleAnalyze = async () => {
+    if (isSubmitting) return;
+
+    const hasManual = manualSymbols.trim().length > 0;
+    const hasFile = Boolean(selectedFile);
+    if (!hasManual && !hasFile) {
+      setErrorMessage("Add symbols or paste/upload a watchlist image first.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    setErrorMessage("");
+
+    try {
+      const payload = new FormData();
+      if (hasFile && selectedFile) {
+        payload.append("file", selectedFile);
+      }
+      if (hasManual) {
+        payload.append("manual_symbols", manualSymbols);
+      }
+
+      const response = await fetch("/api/ocr", {
+        method: "POST",
+        body: payload,
+      });
+
+      if (!response.ok) {
+        throw new Error(`OCR request failed: ${response.status}`);
+      }
+
+      const data = (await response.json()) as OcrResponse;
+      const extracted = Array.isArray(data.symbols) ? data.symbols : [];
+
+      if (!extracted.length) {
+        setErrorMessage("No valid symbols detected. Try clearer image or type symbols manually.");
+        return;
+      }
+
+      clearAll();
+      setSymbols(extracted);
+      router.push("/dashboard");
+    } catch {
+      setErrorMessage("Could not start analysis. Please try again.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items;
+      if (!items || !items.length) return;
+
+      for (const item of items) {
+        if (!item.type.startsWith("image/")) {
+          continue;
+        }
+
+        const file = item.getAsFile();
+        if (!file) {
+          continue;
+        }
+
+        event.preventDefault();
+        applySelectedFile(file);
+        return;
+      }
+    };
+
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, []);
 
   return (
     <main
@@ -37,16 +138,17 @@ export default function Home() {
               <UploadCloud size={48} className="text-blue-400" />
             </div>
             <p className="text-white font-medium text-lg">Drop watchlist screenshot here</p>
-            <p className="text-gray-500 text-sm">PNG, JPG supported</p>
+            <p className="text-gray-500 text-sm">PNG, JPG supported. You can also press Ctrl/Cmd+V to paste.</p>
             {selectedFileName ? <p className="text-gray-400 text-sm">{selectedFileName}</p> : null}
           </div>
           <input
+            ref={fileInputRef}
             type="file"
             className="hidden"
             accept="image/png,image/jpeg,image/jpg"
             onChange={(e) => {
               const file = e.target.files?.[0];
-              setSelectedFileName(file ? file.name : "");
+              applySelectedFile(file || null);
             }}
           />
         </label>
@@ -57,12 +159,25 @@ export default function Home() {
           className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder:text-gray-500 focus:outline-none focus:border-blue-500/50 focus:bg-white/8 transition-all duration-200"
           style={{ color: "#FFFFFF" }}
           placeholder="Type NSE symbols (e.g. RELIANCE, INFY)"
-          value={symbols}
-          onChange={(e) => setSymbols(e.target.value)}
+          value={manualSymbols}
+          onChange={(e) => setManualSymbols(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              void handleAnalyze();
+            }
+          }}
         />
 
-        <button className="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold text-base py-4 px-8 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-blue-500/25 active:scale-[0.98]">
-          Analyze Stocks -&gt;
+        {errorMessage ? <p className="w-full text-left text-sm text-red-300">{errorMessage}</p> : null}
+
+        <button
+          type="button"
+          onClick={() => void handleAnalyze()}
+          disabled={isSubmitting}
+          className="w-full bg-blue-600 hover:bg-blue-500 disabled:bg-blue-900/60 disabled:cursor-not-allowed text-white font-semibold text-base py-4 px-8 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-blue-500/25 active:scale-[0.98]"
+        >
+          {isSubmitting ? "Analyzing..." : "Analyze Stocks ->"}
         </button>
       </div>
     </main>
