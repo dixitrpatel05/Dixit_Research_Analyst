@@ -1,13 +1,16 @@
 import asyncio
 import json
-import os
 from typing import Any
 
 import google.generativeai as genai
 
+from env import get_backend_key
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")
+_gemini_api_key = get_backend_key("gemini")
+model = None
+if _gemini_api_key:
+    genai.configure(api_key=_gemini_api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
 
 def _safe_json_load(text: str) -> dict:
@@ -35,6 +38,9 @@ def _safe_json_load(text: str) -> dict:
 
 def call_gemini(prompt: str) -> dict:
     """Call Gemini and parse JSON response with retry logic."""
+    if model is None:
+        return {}
+
     for attempt in range(3):
         try:
             response = model.generate_content(

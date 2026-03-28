@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -9,6 +8,8 @@ import httpx
 import yfinance as yf
 from bs4 import BeautifulSoup
 from tavily import TavilyClient
+
+from env import get_backend_key
 
 
 NSE_HEADERS = {
@@ -473,7 +474,7 @@ async def tavily_news_search(symbol: str, company_name: str) -> list[dict]:
     """
     Run 3 targeted Tavily queries and merge top relevant articles.
     """
-    api_key = os.getenv("TAVILY_API_KEY")
+    api_key = get_backend_key("tavily")
     if not api_key:
         return []
 
@@ -524,7 +525,7 @@ async def newsdata_fetch(symbol: str, company_name: str) -> list[dict]:
     """
     Fetch business news from NewsData.io for the company.
     """
-    api_key = os.getenv("NEWSDATA_API_KEY")
+    api_key = get_backend_key("newsdata")
     if not api_key:
         return []
 

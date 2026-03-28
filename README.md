@@ -71,6 +71,22 @@ npm run build
 
 Both commands pass.
 
+## Zero-Edit Deployment Env Setup (Vercel + Railway)
+
+- Frontend (`frontend/next.config.js`) auto-detects backend URL in this order:
+	1. `BACKEND_API_URL`
+	2. `NEXT_PUBLIC_API_URL`
+	3. `RAILWAY_BACKEND_URL`
+	4. `RAILWAY_PUBLIC_DOMAIN`
+	5. `RAILWAY_STATIC_URL`
+- Backend auto-detects provider keys with aliases:
+	- Gemini: `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`
+	- Tavily: `TAVILY_API_KEY`, `TAVILY_KEY`
+	- NewsData: `NEWSDATA_API_KEY`, `NEWSDATAIO_API_KEY`
+	- GNews: `GNEWS_API_KEY`, `GNEWS_TOKEN`
+
+This allows Railway/Vercel project environment variables to be used directly without editing source files.
+
 ## Next Accuracy Upgrade
 
 The current model already includes institutional-weighted scoring and latest filing/insider freshness checks. A future upgrade can add extra NSE/BSE alternate free data adapters as optional fallback layers.

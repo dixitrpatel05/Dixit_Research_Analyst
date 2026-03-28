@@ -3,27 +3,19 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import os
 import re
 from datetime import datetime, timedelta, timezone
-from pathlib import Path as FilePath
 from typing import Any
 
 import httpx
 import pytesseract
-from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Path, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
-BASE_DIR = FilePath(__file__).resolve().parent
-ROOT_DIR = BASE_DIR.parent
-
-# Load environment before importing modules that read keys at import time.
-load_dotenv(ROOT_DIR / ".env.local")
-load_dotenv(ROOT_DIR / ".env")
+from env import get_backend_key, has_backend_key
 
 from ai_analyzer import analyze_stock_with_gemini
 from data_collectors import (
@@ -160,7 +152,7 @@ def _parse_manual_symbols(manual_symbols: str | None) -> list[str]:
 
 
 async def _gnews_fetch(symbol: str, company_name: str) -> list[dict]:
-    key = os.getenv("GNEWS_API_KEY")
+    key = get_backend_key("gnews")
     if not key:
         return []
 
@@ -458,10 +450,10 @@ async def get_report_pdf(symbol: str = Path(..., min_length=2, max_length=15)) -
 @app.get("/api/health")
 async def health() -> JSONResponse:
     env_health = {
-        "gemini": bool(os.getenv("GEMINI_API_KEY")),
-        "tavily": bool(os.getenv("TAVILY_API_KEY")),
-        "newsdata": bool(os.getenv("NEWSDATA_API_KEY")),
-        "gnews": bool(os.getenv("GNEWS_API_KEY")),
+        "gemini": has_backend_key("gemini"),
+        "tavily": has_backend_key("tavily"),
+        "newsdata": has_backend_key("newsdata"),
+        "gnews": has_backend_key("gnews"),
     }
 
     return JSONResponse(
