@@ -4,7 +4,10 @@ from datetime import datetime
 from html import escape
 from typing import Any
 
-from weasyprint import HTML
+try:
+  from weasyprint import HTML
+except Exception:
+  HTML = None
 
 
 def _inr(value: Any) -> str:
@@ -450,11 +453,17 @@ def generate_report_html(report: dict) -> str:
 
 
 def generate_pdf_bytes(report: dict) -> bytes:
+  if HTML is None:
+    raise RuntimeError("PDF engine unavailable: WeasyPrint dependencies are missing in runtime environment.")
+
     html = generate_report_html(report)
     return HTML(string=html).write_pdf()
 
 
 def generate_pdf_file(report: dict, output_path: str) -> str:
+  if HTML is None:
+    raise RuntimeError("PDF engine unavailable: WeasyPrint dependencies are missing in runtime environment.")
+
     html = generate_report_html(report)
     HTML(string=html).write_pdf(target=output_path)
     return output_path
