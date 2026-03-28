@@ -73,10 +73,18 @@ export interface CatalystQuestionAnswer {
   id: number;
   question: string;
   answer: "YES" | "NO";
+  signal: "BULLISH" | "BEARISH" | "NEUTRAL" | "NO SIGNAL";
   timeframe: string;
   reasoning: string;
   evidence: string[];
   sources: string[];
+}
+
+export interface FilingItem {
+  title: string;
+  date: string;
+  source: string;
+  url?: string;
 }
 
 export interface NewsItem {
@@ -109,6 +117,7 @@ export interface StockSnapshot {
   businessSummary: string | null;
   returnOnEquity: number | null;
   latestFilingDate: string | null;
+  recentFilings: FilingItem[];
   latestInsiderTransactionDate: string | null;
   insiderNetShares: number | null;
   priceHistory: TimeSeriesPoint[];

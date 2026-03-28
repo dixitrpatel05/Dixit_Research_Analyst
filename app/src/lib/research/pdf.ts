@@ -1,4 +1,4 @@
-import { PDFDocument, PDFPage, StandardFonts, rgb } from "pdf-lib";
+import { PDFFont, PDFDocument, PDFPage, StandardFonts, rgb } from "pdf-lib";
 import { StockResearchRow, StockSnapshot, TimeSeriesPoint } from "./types";
 
 const LEFT = 50;
@@ -63,6 +63,56 @@ function wrapRichText(text: string, maxChars = MAX_CHARS): TextLine[] {
     wrapped.forEach((line) => output.push({ text: line }));
   }
   return output;
+}
+
+function wrapLineByWidth(
+  text: string,
+  maxWidth: number,
+  fontSize: number,
+  font: PDFFont,
+): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let current = "";
+
+  const flush = () => {
+    if (current) {
+      lines.push(current);
+      current = "";
+    }
+  };
+
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) {
+      current = candidate;
+      continue;
+    }
+
+    if (current) {
+      flush();
+    }
+
+    if (font.widthOfTextAtSize(word, fontSize) <= maxWidth) {
+      current = word;
+      continue;
+    }
+
+    let chunk = "";
+    for (const ch of word) {
+      const next = `${chunk}${ch}`;
+      if (font.widthOfTextAtSize(next, fontSize) <= maxWidth) {
+        chunk = next;
+      } else {
+        lines.push(chunk);
+        chunk = ch;
+      }
+    }
+    current = chunk;
+  }
+
+  flush();
+  return lines;
 }
 
 function drawSectionCard(page: PDFPage, x: number, y: number, width: number, height: number) {
@@ -327,6 +377,12 @@ export async function buildResearchPdfBase64(
 
   y -= LINE_HEIGHT;
   drawSectionCard(page, LEFT, y - 130, 495, 130);
+  page.drawLine({
+    start: { x: LEFT + 288, y: y - 126 },
+    end: { x: LEFT + 288, y: y - 2 },
+    thickness: 1,
+    color: rgb(0.87, 0.9, 0.93),
+  });
   page.drawText("Catalyst Snapshot", {
     x: LEFT + 8,
     y: y - 12,
@@ -338,8 +394,8 @@ export async function buildResearchPdfBase64(
   let cy = y - 28;
   const summaryLines = row.catalystSummary
     .slice(0, 4)
-    .flatMap((line) => wrapLine(`- ${line}`, 52))
-    .slice(0, 9);
+    .flatMap((line) => wrapLineByWidth(`- ${line}`, 268, 8.5, bodyFont))
+    .slice(0, 10);
   for (const line of summaryLines) {
     page.drawText(line, {
       x: LEFT + 10,
@@ -365,7 +421,7 @@ export async function buildResearchPdfBase64(
       font: titleFont,
     });
     ry -= 10;
-    for (const part of wrapLine(event.title, 28).slice(0, 3)) {
+    for (const part of wrapLineByWidth(event.title, 176, 8, bodyFont).slice(0, 4)) {
       if (ry < y - 118) {
         break;
       }
@@ -402,7 +458,7 @@ export async function buildResearchPdfBase64(
     row.catalystReport.questionAnswers.length > 0
       ? row.catalystReport.questionAnswers.map(
           (item) =>
-            `   Q${item.id} [${item.answer}] ${item.question} (${item.timeframe}) - ${item.reasoning}`,
+            `   Q${item.id} [${item.answer}] [${item.signal}] ${item.question} (${item.timeframe}) - ${item.reasoning}`,
         )
       : [
           `   Q-checks unavailable for this run.`,
@@ -416,7 +472,7 @@ export async function buildResearchPdfBase64(
   );
 
   for (const text of reportLines) {
-    const wrapped = wrapLine(text, 102);
+    const wrapped = wrapLineByWidth(text, 495, 8.5, bodyFont);
     for (const line of wrapped) {
       if (y < 180) {
         break;

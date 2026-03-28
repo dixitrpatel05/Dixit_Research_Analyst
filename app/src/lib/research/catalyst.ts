@@ -2,13 +2,26 @@ import {
   CatalystEvent,
   CatalystQuestionAnswer,
   CatalystReport,
+  FilingItem,
   StockSnapshot,
 } from "./types";
 
-type NewsMatch = {
+type EvidenceItem = {
   title: string;
   date: string;
-  url: string;
+  source: string;
+  url?: string;
+  tier: "filing" | "news" | "derived";
+};
+
+type QuestionBuildInput = {
+  id: number;
+  question: string;
+  timeframe: string;
+  evidence: EvidenceItem[];
+  signalWhenYes: "BULLISH" | "BEARISH" | "NEUTRAL";
+  yesSummary: string;
+  noSummary: string;
 };
 
 function todayYmd(): string {
@@ -31,59 +44,126 @@ function withinDays(dateStr: string | null, days: number): boolean {
   return age !== null && age >= 0 && age <= days;
 }
 
-function findNewsMatches(
-  snapshot: StockSnapshot,
-  keywords: RegExp,
-  maxAgeDays: number,
-): NewsMatch[] {
-  return snapshot.recentNews
-    .filter((item) => item.date && withinDays(item.date, maxAgeDays) && keywords.test(item.title.toLowerCase()))
+function normalizeFilingSource(item: FilingItem): string {
+  return item.source || `NSE/BSE filing (${item.date})`;
+}
+
+function filingEvidence(snapshot: StockSnapshot, regex: RegExp, maxDays: number): EvidenceItem[] {
+  return snapshot.recentFilings
+    .filter((item) => withinDays(item.date, maxDays) && regex.test(item.title.toLowerCase()))
     .map((item) => ({
       title: item.title,
-      date: item.date ?? todayYmd(),
+      date: item.date,
+      source: normalizeFilingSource(item),
       url: item.url,
+      tier: "filing" as const,
     }));
 }
 
-function toDirection(answer: "YES" | "NO", isNegative = false): "Bullish" | "Neutral" | "Cautious" {
-  if (answer === "NO") {
-    return "Neutral";
-  }
-  return isNegative ? "Cautious" : "Bullish";
+function newsEvidence(snapshot: StockSnapshot, regex: RegExp, maxDays: number): EvidenceItem[] {
+  return snapshot.recentNews
+    .filter((item) => withinDays(item.date, maxDays) && regex.test(item.title.toLowerCase()))
+    .map((item) => ({
+      title: item.title,
+      date: item.date ?? todayYmd(),
+      source: `Financial media (${item.date ?? "date n/a"})`,
+      url: item.url,
+      tier: "news" as const,
+    }));
 }
 
-function buildQa(params: {
-  id: number;
-  question: string;
-  timeframe: string;
-  yes: boolean;
-  reasoningYes: string;
-  reasoningNo: string;
-  evidence: string[];
-  sources: string[];
-}): CatalystQuestionAnswer {
+function pickEvidence(snapshot: StockSnapshot, regex: RegExp, maxDays: number): EvidenceItem[] {
+  const filings = filingEvidence(snapshot, regex, maxDays);
+  const news = newsEvidence(snapshot, regex, maxDays);
+  return [...filings, ...news]
+    .sort((a, b) => {
+      if (a.tier !== b.tier) {
+        return a.tier === "filing" ? -1 : 1;
+      }
+      return a.date < b.date ? 1 : -1;
+    })
+    .slice(0, 3);
+}
+
+function signalFromAnswer(
+  hasEvidence: boolean,
+  yesSignal: "BULLISH" | "BEARISH" | "NEUTRAL",
+): "BULLISH" | "BEARISH" | "NEUTRAL" | "NO SIGNAL" {
+  if (!hasEvidence) {
+    return "NO SIGNAL";
+  }
+  return yesSignal;
+}
+
+function buildQuestionAnswer(input: QuestionBuildInput): CatalystQuestionAnswer {
+  const hasEvidence = input.evidence.length > 0;
+  const best = input.evidence[0];
+
+  const reasoning = hasEvidence
+    ? `${input.yesSummary} Source: ${best.source}${best.url ? ` (${best.url})` : ""}; Date: ${best.date}. ` +
+      `Analytical read-through: ${best.title} is material enough to flag ${input.signalWhenYes.toLowerCase()} bias for near-term price action.`
+    : input.noSummary;
+
   return {
-    id: params.id,
-    question: params.question,
-    timeframe: params.timeframe,
-    answer: params.yes ? "YES" : "NO",
-    reasoning: params.yes ? params.reasoningYes : params.reasoningNo,
-    evidence: params.evidence,
-    sources: params.sources,
+    id: input.id,
+    question: input.question,
+    answer: hasEvidence ? "YES" : "NO",
+    signal: signalFromAnswer(hasEvidence, input.signalWhenYes),
+    timeframe: input.timeframe,
+    reasoning,
+    evidence: input.evidence.map((item) => `${item.date}: ${item.title}`),
+    sources: input.evidence.map((item) => item.url).filter((item): item is string => Boolean(item)),
   };
+}
+
+function primaryFromAnswers(answers: CatalystQuestionAnswer[]): CatalystQuestionAnswer | null {
+  const priority = [1, 4, 2, 5, 3, 6, 7, 9, 10, 8];
+  for (const id of priority) {
+    const found = answers.find((item) => item.id === id && item.answer === "YES");
+    if (found) {
+      return found;
+    }
+  }
+  return null;
+}
+
+function confidenceFromAnswers(answers: CatalystQuestionAnswer[]): number {
+  const yes = answers.filter((item) => item.answer === "YES");
+  const filingBacked = yes.filter((item) => item.evidence.some((line) => /filing/i.test(line))).length;
+  const score = Math.min(10, Math.max(1, yes.length * 0.7 + filingBacked * 0.9 + 1.5));
+  return Math.round(score * 10) / 10;
 }
 
 function confidenceLabel(score: number): string {
   if (score >= 8.5) {
-    return "High confidence from time-bounded and source-tagged evidence.";
+    return "High confidence: filing-linked and time-bounded evidence supports catalyst attribution.";
   }
   if (score >= 6.5) {
-    return "Medium confidence with partial evidence coverage across the 10 checks.";
+    return "Medium confidence: multiple checks are YES but some are based on secondary news flow.";
   }
   if (score >= 5) {
-    return "Moderate confidence; mostly secondary signals and limited official confirmation.";
+    return "Moderate confidence: limited direct filings; catalyst signal is mixed.";
   }
-  return "Low confidence; most checks returned NO in current evidence window.";
+  return "Low confidence: most checks are NO and current move may be technical/sentiment-led.";
+}
+
+function overallDirection(answers: CatalystQuestionAnswer[]): "BULLISH" | "BEARISH" | "NEUTRAL" | "MIXED" {
+  const yes = answers.filter((item) => item.answer === "YES");
+  const bull = yes.filter((item) => item.signal === "BULLISH").length;
+  const bear = yes.filter((item) => item.signal === "BEARISH").length;
+  if (bull === 0 && bear === 0) {
+    return "NEUTRAL";
+  }
+  if (bull >= bear + 2) {
+    return "BULLISH";
+  }
+  if (bear >= bull + 2) {
+    return "BEARISH";
+  }
+  if (bull === bear) {
+    return "MIXED";
+  }
+  return bull > bear ? "BULLISH" : "BEARISH";
 }
 
 export function buildCatalystInsight(snapshot: StockSnapshot): {
@@ -92,270 +172,284 @@ export function buildCatalystInsight(snapshot: StockSnapshot): {
   events: CatalystEvent[];
   report: CatalystReport;
 } {
-  const q1News = findNewsMatches(
-    snapshot,
-    /(order win|letter of award|\bloa\b|contract|new order|partnership|expansion)/,
-    14,
-  );
-  const q1Yes = q1News.length > 0;
+  const q1 = buildQuestionAnswer({
+    id: 1,
+    question: "Order wins or business expansion in last 14 days?",
+    timeframe: "14 days",
+    evidence: pickEvidence(
+      snapshot,
+      /(order win|letter of award|\bloa\b|contract|mou|partnership|strategic partnership|business expansion)/,
+      14,
+    ),
+    signalWhenYes: "BULLISH",
+    yesSummary: "YES: order/business expansion evidence found within the defined window.",
+    noSummary:
+      "NO: No order win, contract award, or partnership announcement found in exchange filings or verified news sources within the 14-day window.",
+  });
 
-  const q2News = findNewsMatches(
+  const q2Base = pickEvidence(
     snapshot,
-    /(bulk deal|block deal|\bfii\b|\bdii\b|mutual fund bought|stake increase)/,
+    /(bulk deal|block deal|\bfii\b|\bdii\b|mutual fund|institutional buy|institutional sell|stake change)/,
     30,
   );
-  const q2Yes = q2News.length > 0 || (withinDays(snapshot.latestInsiderTransactionDate, 30) && (snapshot.insiderNetShares ?? 0) !== 0);
+  const q2Derived: EvidenceItem[] = withinDays(snapshot.latestInsiderTransactionDate, 30)
+    ? [
+        {
+          title: `Insider net shares: ${snapshot.insiderNetShares ?? 0}`,
+          date: snapshot.latestInsiderTransactionDate ?? todayYmd(),
+          source: `Insider disclosure (${snapshot.latestInsiderTransactionDate ?? todayYmd()})`,
+          tier: "derived" as const,
+        },
+      ]
+    : [];
+  const q2Evidence = [...q2Base, ...q2Derived].slice(0, 3);
+  const q2Signal = (snapshot.insiderNetShares ?? 0) < 0 ? "BEARISH" : "BULLISH";
+  const q2 = buildQuestionAnswer({
+    id: 2,
+    question: "Institutional/smart-money activity in last 30 days?",
+    timeframe: "30 days",
+    evidence: q2Evidence,
+    signalWhenYes: q2Signal,
+    yesSummary: "YES: institutional/insider flow signal detected in the 30-day window.",
+    noSummary:
+      "NO: No bulk deals, block deals, or significant institutional flow detected in NSE/BSE-linked evidence for the 30-day window.",
+  });
 
-  const q3News = findNewsMatches(
+  const q3 = buildQuestionAnswer({
+    id: 3,
+    question: "Brokerage upgrades/target revisions in last 7 days?",
+    timeframe: "7 days",
+    evidence: pickEvidence(
+      snapshot,
+      /(target price|upgrade|overweight|initiates coverage|buy rating|outperform|downgrade)/,
+      7,
+    ),
+    signalWhenYes: "BULLISH",
+    yesSummary: "YES: brokerage action signal detected in the 7-day window.",
+    noSummary:
+      "NO: No brokerage upgrade, initiation, or target-price revision detected in the 7-day window across tracked coverage signals.",
+  });
+
+  const q4 = buildQuestionAnswer({
+    id: 4,
+    question: "Earnings surprise signal in last 14 days?",
+    timeframe: "14 days",
+    evidence: [
+      ...pickEvidence(
+        snapshot,
+        /(q1|q2|q3|q4|results|ebitda|pat|beat estimates|margin expansion|earnings beat|earnings miss)/,
+        14,
+      ),
+      ...(withinDays(snapshot.latestFilingDate, 14)
+        ? [
+            {
+              title: `Recent exchange filing timestamp with earnings growth ${((snapshot.earningsGrowth ?? 0) * 100).toFixed(1)}%`,
+              date: snapshot.latestFilingDate ?? todayYmd(),
+              source: `NSE/BSE filing (${snapshot.latestFilingDate ?? todayYmd()})`,
+              tier: "filing" as const,
+            },
+          ]
+        : []),
+    ].slice(0, 3),
+    signalWhenYes: (snapshot.earningsGrowth ?? 0) >= 0 ? "BULLISH" : "BEARISH",
+    yesSummary: "YES: earnings/event update detected with fresh filing alignment.",
+    noSummary:
+      "NO: No quarterly earnings release or operational update found within the 14-day window.",
+  });
+
+  const q5 = buildQuestionAnswer({
+    id: 5,
+    question: "Insider/promoter action in last 3 months?",
+    timeframe: "3 months",
+    evidence: [
+      ...pickEvidence(
+        snapshot,
+        /(promoter buying|promoter selling|open market purchase|sast|insider trading|pledge|stake increase|stake sale)/,
+        90,
+      ),
+      ...(withinDays(snapshot.latestInsiderTransactionDate, 90)
+        ? [
+            {
+              title: `Insider net shares ${snapshot.insiderNetShares ?? 0}`,
+              date: snapshot.latestInsiderTransactionDate ?? todayYmd(),
+              source: `Insider disclosure (${snapshot.latestInsiderTransactionDate ?? todayYmd()})`,
+              tier: "derived" as const,
+            },
+          ]
+        : []),
+    ].slice(0, 3),
+    signalWhenYes: (snapshot.insiderNetShares ?? 0) < 0 ? "BEARISH" : "BULLISH",
+    yesSummary: "YES: promoter/insider action is visible in the 3-month lookback.",
+    noSummary:
+      "NO: No promoter or insider buying/selling disclosed in SEBI/BSE-linked evidence within the 3-month window.",
+  });
+
+  const q6 = buildQuestionAnswer({
+    id: 6,
+    question: "Corporate action announced (bonus/split/dividend/buyback)?",
+    timeframe: "latest board window",
+    evidence: pickEvidence(
+      snapshot,
+      /(board meeting|bonus|stock split|dividend|buyback|record date|ex-date|rights issue)/,
+      120,
+    ),
+    signalWhenYes: "NEUTRAL",
+    yesSummary: "YES: board/corporate-action trigger is present in available disclosures.",
+    noSummary:
+      "NO: No corporate action announcement or board notice related to split/bonus/dividend/buyback was found in current evidence.",
+  });
+
+  const q7 = buildQuestionAnswer({
+    id: 7,
+    question: "M&A or fundraising announced/approved in last 30 days?",
+    timeframe: "30 days",
+    evidence: pickEvidence(
+      snapshot,
+      /(acquisition|merger|demerger|asset sale|\bqip\b|preferential issue|fund raising|fundraising|rights issue|ncd|debenture)/,
+      30,
+    ),
+    signalWhenYes: "NEUTRAL",
+    yesSummary: "YES: strategic transaction/fundraising indicator is present in the defined window.",
+    noSummary:
+      "NO: No M&A transaction, strategic acquisition, or fundraising announcement found within the 30-day window.",
+  });
+
+  const q8 = buildQuestionAnswer({
+    id: 8,
+    question: "Sectoral or macro tailwind in last 30 days?",
+    timeframe: "30 days",
+    evidence: pickEvidence(
+      snapshot,
+      /(pli|subsidy|import duty|government approval|policy|budget allocation|tariff|regulation)/,
+      30,
+    ),
+    signalWhenYes: "NEUTRAL",
+    yesSummary: "YES: sector-policy/macro tailwind reference found in recent items.",
+    noSummary:
+      "NO: No direct sector-specific policy or macro tailwind identified in the 30-day window for this company.",
+  });
+
+  const q9Evidence = pickEvidence(
     snapshot,
-    /(target price|upgrade|overweight|initiates coverage|buy rating|outperform)/,
-    7,
+    /(usfda|eir|show cause|sebi|income tax|gst demand|import alert|clearance|probe|notice|summons)/,
+    180,
   );
-  const q3Yes = q3News.length > 0;
-
-  const q4News = findNewsMatches(
-    snapshot,
-    /(results|\bpat\b|ebitda|beat estimates|margin jump|profit jump|q1|q2|q3|q4)/,
-    14,
+  const q9Negative = q9Evidence.some((item) =>
+    /(show cause|income tax|gst demand|import alert|probe|summons|notice)/i.test(item.title),
   );
-  const q4Yes = q4News.length > 0 || (withinDays(snapshot.latestFilingDate, 14) && (snapshot.earningsGrowth ?? 0) > 0.08);
+  const q9 = buildQuestionAnswer({
+    id: 9,
+    question: "Regulatory action or clearance since last earnings?",
+    timeframe: "latest available",
+    evidence: q9Evidence,
+    signalWhenYes: q9Negative ? "BEARISH" : "BULLISH",
+    yesSummary: q9Negative
+      ? "YES: adverse regulatory mention detected; treat as risk flag until clarified."
+      : "YES: regulatory clearance/approval-style mention detected.",
+    noSummary:
+      "NO: No significant regulatory approval or adverse regulatory action found in available disclosures.",
+  });
 
-  const q5News = findNewsMatches(
+  const q10Evidence = pickEvidence(
     snapshot,
-    /(promoter buying|open market purchase|increases stake|insider buying|insider selling|pledge invocation)/,
-    90,
-  );
-  const q5Yes = q5News.length > 0 || (withinDays(snapshot.latestInsiderTransactionDate, 90) && (snapshot.insiderNetShares ?? 0) !== 0);
-
-  const q6News = findNewsMatches(
-    snapshot,
-    /(board meeting|bonus|stock split|dividend|buyback|record date|ex-date)/,
-    90,
-  );
-  const q6Yes = q6News.length > 0;
-
-  const q7News = findNewsMatches(
-    snapshot,
-    /(acquisition|merger|\bqip\b|preferential issue|fund rais(ing|e)|announced|approved)/,
-    90,
-  );
-  const q7Yes = q7News.length > 0;
-
-  const q8News = findNewsMatches(
-    snapshot,
-    /(pli scheme|subsidy|import duty|government approval|policy|tailwind)/,
+    /(resignation|appointment|change).*(ceo|md|cfo|auditor|director)|(ceo|md|cfo|auditor|director).*(resignation|appointment|change)/,
     30,
   );
-  const q8Yes = q8News.length > 0;
+  const q10RedFlag = q10Evidence.some((item) => /(auditor|cfo).*(resignation|exit)|resignation.*(auditor|cfo)/i.test(item.title));
+  const q10 = buildQuestionAnswer({
+    id: 10,
+    question: "Management or auditor changes in last 30 days?",
+    timeframe: "30 days",
+    evidence: q10Evidence,
+    signalWhenYes: q10RedFlag ? "BEARISH" : "NEUTRAL",
+    yesSummary: q10RedFlag
+      ? "YES: leadership/auditor change detected with potential governance concern."
+      : "YES: management change detected; monitor for transition risk.",
+    noSummary:
+      "NO: No management or auditor change disclosed in exchange-linked evidence within the 30-day window.",
+  });
 
-  const q9News = findNewsMatches(
-    snapshot,
-    /(usfda|\beir\b|show cause notice|\bsebi\b|income tax search|import alert|clearance)/,
-    120,
-  );
-  const q9Yes = q9News.length > 0;
-  const q9Negative = q9News.some((item) => /(show cause|income tax search|import alert|notice)/i.test(item.title));
+  const answers: CatalystQuestionAnswer[] = [q1, q2, q3, q4, q5, q6, q7, q8, q9, q10];
+  const yesAnswers = answers.filter((item) => item.answer === "YES");
+  const noAnswers = answers.filter((item) => item.answer === "NO");
 
-  const q10News = findNewsMatches(
-    snapshot,
-    /(resignation|appointment).*(ceo|md|cfo|auditor)|(ceo|md|cfo|auditor).*(resignation|appointment)/,
-    30,
-  );
-  const q10Yes = q10News.length > 0;
+  const primary = primaryFromAnswers(answers);
+  const direction = overallDirection(answers);
+  const confidenceScore = confidenceFromAnswers(answers);
 
-  const qa: CatalystQuestionAnswer[] = [
-    buildQa({
-      id: 1,
-      question: "Order wins or business expansion in last 14 days?",
-      timeframe: "14 days",
-      yes: q1Yes,
-      reasoningYes: "Matched order/contract/partnership keywords in time-bounded news evidence.",
-      reasoningNo: "No time-bounded order/LOA/contract signal found in current data feed.",
-      evidence: q1News.slice(0, 2).map((item) => `${item.date}: ${item.title}`),
-      sources: q1News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 2,
-      question: "Institutional or smart-money activity in last 30 days?",
-      timeframe: "30 days",
-      yes: q2Yes,
-      reasoningYes: "Detected insider/institutional flow indicator inside defined window.",
-      reasoningNo: "No block/bulk/FII/DII or insider flow confirmation inside 30 days.",
-      evidence: [
-        ...(withinDays(snapshot.latestInsiderTransactionDate, 30)
-          ? [`${snapshot.latestInsiderTransactionDate}: insider net shares ${snapshot.insiderNetShares ?? 0}`]
-          : []),
-        ...q2News.slice(0, 1).map((item) => `${item.date}: ${item.title}`),
-      ],
-      sources: q2News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 3,
-      question: "Brokerage upgrades/target revisions in last 7 days?",
-      timeframe: "7 days",
-      yes: q3Yes,
-      reasoningYes: "Upgrade/target-price language detected within 7-day window.",
-      reasoningNo: "No recent verified brokerage upgrade/target-price cue in current feed.",
-      evidence: q3News.slice(0, 2).map((item) => `${item.date}: ${item.title}`),
-      sources: q3News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 4,
-      question: "Earnings surprise signal in last 14 days?",
-      timeframe: "14 days",
-      yes: q4Yes,
-      reasoningYes: "Recent results-related signal and/or filing freshness with positive earnings trend found.",
-      reasoningNo: "No qualified earnings-beat signal found inside 14-day filter.",
-      evidence: [
-        ...(withinDays(snapshot.latestFilingDate, 14) ? [`${snapshot.latestFilingDate}: latest filing timestamp`] : []),
-        ...q4News.slice(0, 1).map((item) => `${item.date}: ${item.title}`),
-      ],
-      sources: q4News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 5,
-      question: "Insider/promoter action in last 3 months?",
-      timeframe: "3 months",
-      yes: q5Yes,
-      reasoningYes: "Insider/promoter activity present in filings/news within 3 months.",
-      reasoningNo: "No promoter/insider action confirmation in the 3-month window.",
-      evidence: [
-        ...(withinDays(snapshot.latestInsiderTransactionDate, 90)
-          ? [`${snapshot.latestInsiderTransactionDate}: insider net shares ${snapshot.insiderNetShares ?? 0}`]
-          : []),
-        ...q5News.slice(0, 1).map((item) => `${item.date}: ${item.title}`),
-      ],
-      sources: q5News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 6,
-      question: "Corporate action announced (bonus/split/dividend/buyback)?",
-      timeframe: "latest available",
-      yes: q6Yes,
-      reasoningYes: "Corporate-action terms found in relevant news lines.",
-      reasoningNo: "No concrete corporate-action announcement detected in current feed.",
-      evidence: q6News.slice(0, 2).map((item) => `${item.date}: ${item.title}`),
-      sources: q6News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 7,
-      question: "M&A or fundraising announced/approved?",
-      timeframe: "latest available",
-      yes: q7Yes,
-      reasoningYes: "M&A/fund-raise language detected in announcement/news evidence.",
-      reasoningNo: "No announced/approved M&A or fundraising signal found.",
-      evidence: q7News.slice(0, 2).map((item) => `${item.date}: ${item.title}`),
-      sources: q7News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 8,
-      question: "Sector or macro tailwind in last 30 days?",
-      timeframe: "30 days",
-      yes: q8Yes,
-      reasoningYes: "Policy/tailwind keyword match found in sector-related news.",
-      reasoningNo: "No direct sector-policy tailwind linkage found in 30-day window.",
-      evidence: q8News.slice(0, 2).map((item) => `${item.date}: ${item.title}`),
-      sources: q8News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 9,
-      question: "Regulatory action/clearance signal present?",
-      timeframe: "latest available",
-      yes: q9Yes,
-      reasoningYes: q9Negative
-        ? "Regulatory mention found with potentially adverse wording."
-        : "Regulatory mention found with non-adverse wording.",
-      reasoningNo: "No regulatory trigger keywords detected in current source window.",
-      evidence: q9News.slice(0, 2).map((item) => `${item.date}: ${item.title}`),
-      sources: q9News.slice(0, 2).map((item) => item.url),
-    }),
-    buildQa({
-      id: 10,
-      question: "Management change (CEO/MD/CFO/Auditor) in last 30 days?",
-      timeframe: "30 days",
-      yes: q10Yes,
-      reasoningYes: "Management-change wording detected in recent items.",
-      reasoningNo: "No management change signal in 30-day scan window.",
-      evidence: q10News.slice(0, 2).map((item) => `${item.date}: ${item.title}`),
-      sources: q10News.slice(0, 2).map((item) => item.url),
-    }),
-  ];
+  const redFlags = answers
+    .filter((item) => item.signal === "BEARISH" && item.answer === "YES")
+    .map((item) => `Q${item.id}: ${item.question}`);
 
-  const yesAnswers = qa.filter((item) => item.answer === "YES");
-  const noAnswers = qa.filter((item) => item.answer === "NO");
+  const finalSynthesis =
+    yesAnswers.length === 0
+      ? "Result: No material news/events found. Move is likely technical."
+      : `${direction}: Primary catalyst is Q${primary?.id ?? "?"} with ${yesAnswers.length}/10 checks marked YES. ` +
+        `${redFlags.length > 0 ? `Red flags: ${redFlags.join("; ")}.` : "No major red flags detected in YES set."}`;
 
-  const weightedYesScore = Math.round(
-    qa.reduce((acc, item) => {
-      if (item.answer === "NO") {
-        return acc;
-      }
-      const weight = item.id <= 4 ? 11 : item.id <= 7 ? 8 : 6;
-      return acc + weight;
-    }, 0),
-  );
-  const catalystScore = Math.max(0, Math.min(100, weightedYesScore));
-
-  const confidenceScore = Math.round(
-    Math.max(1, Math.min(10, (yesAnswers.length / 10) * 7 + (snapshot.latestFilingDate ? 2 : 0.7))) *
-      10,
-  ) / 10;
-
-  const primaryYes = yesAnswers[0] ?? null;
-  const executiveSummary = primaryYes
-    ? `${snapshot.symbol}: ${yesAnswers.length}/10 catalyst checks are YES. Strongest confirmed trigger is Q${primaryYes.id} (${primaryYes.question.toLowerCase()}) in the defined timeframe.`
-    : `${snapshot.symbol}: all 10 catalyst checks are NO in current data window; move likely technical unless fresh exchange disclosures appear.`;
-
-  const primaryCatalyst = primaryYes
+  const primaryCatalyst = primary
     ? {
-        reason: `Q${primaryYes.id}: ${primaryYes.question}`,
-        details: primaryYes.reasoning,
-        source: primaryYes.sources[0] ?? "No URL captured in current feed",
-        date: primaryYes.evidence[0]?.slice(0, 10) ?? (snapshot.closeDate ?? todayYmd()),
+        reason: `Q${primary.id} — ${primary.question}`,
+        details: primary.reasoning,
+        source: primary.sources[0] ?? "NSE/BSE filing reference not directly available in feed",
+        date: primary.evidence[0]?.slice(0, 10) ?? (snapshot.closeDate ?? todayYmd()),
       }
     : {
-        reason: "No material catalyst detected",
-        details: "No material news/events found. Move is likely technical.",
-        source: "No qualifying evidence in current scan window",
+        reason: "No material catalyst",
+        details:
+          "No fundamental catalyst or verified event was detected in defined lookback windows; current move is likely technical/sentiment-led.",
+        source: "No qualifying source",
         date: todayYmd(),
       };
 
   const secondaryFactors = yesAnswers
-    .slice(1, 4)
-    .map((item) => `Q${item.id} YES: ${item.reasoning}`);
+    .filter((item) => primary?.id !== item.id)
+    .slice(0, 3)
+    .map((item) => `Q${item.id} [${item.signal}] ${item.reasoning}`);
+
   if (secondaryFactors.length === 0) {
-    secondaryFactors.push("No additional secondary catalyst passed YES criteria.");
+    secondaryFactors.push("No secondary catalyst passed YES thresholds.");
   }
 
-  const institutionalActivity = qa
-    .filter((item) => item.id === 2 || item.id === 5)
-    .map((item) => `Q${item.id} ${item.answer}: ${item.reasoning}`);
+  const institutionalActivity = [q2, q5].map(
+    (item) => `Q${item.id} [${item.answer}] [${item.signal}] ${item.reasoning}`,
+  );
 
-  const analystAction = qa
-    .filter((item) => item.id === 3)
-    .map((item) => `Q${item.id} ${item.answer}: ${item.reasoning}`);
+  const analystAction = [q3].map(
+    (item) => `Q${item.id} [${item.answer}] [${item.signal}] ${item.reasoning}`,
+  );
+
+  const bullishSignals = yesAnswers.filter((item) => item.signal === "BULLISH").length;
+  const bearishSignals = yesAnswers.filter((item) => item.signal === "BEARISH").length;
+  const catalystScore = Math.max(0, Math.min(100, 50 + bullishSignals * 9 - bearishSignals * 12 + yesAnswers.length * 2));
 
   const events: CatalystEvent[] = yesAnswers.slice(0, 6).map((item) => ({
-    type: `Q${item.id} catalyst`,
+    type: `Q${item.id}`,
     title: item.reasoning,
     date: item.evidence[0]?.slice(0, 10) ?? (snapshot.closeDate ?? todayYmd()),
-    direction: toDirection(item.answer, item.id === 9 && q9Negative),
-    confidence: Math.min(95, 55 + item.evidence.length * 15),
-    source: item.sources[0] ?? "Yahoo linked news",
+    direction:
+      item.signal === "BULLISH"
+        ? "Bullish"
+        : item.signal === "BEARISH"
+          ? "Cautious"
+          : "Neutral",
+    confidence: Math.min(95, 55 + item.evidence.length * 12),
+    source: item.sources[0] ?? "Filing/news evidence",
     sourceType: item.id <= 2 || item.id === 4 || item.id === 6 || item.id === 9 ? "exchange" : item.id === 3 ? "broker" : "news",
     verified: item.sources.length > 0,
     url: item.sources[0],
   }));
 
-  const finalSynthesis =
-    yesAnswers.length > 0
-      ? `YES catalysts found: ${yesAnswers.map((item) => `Q${item.id}`).join(", ")}. Prioritize Q1/Q4/Q2 evidence over lower-tier signals.`
-      : "Result: No material news/events found. Move is likely technical.";
+  const executiveSummary =
+    yesAnswers.length === 0
+      ? `${snapshot.symbol}: no material event was confirmed across the 10-question catalyst checklist. Directional bias remains neutral and move may be technical.`
+      : `${snapshot.symbol}: ${yesAnswers.length}/10 checks are YES with primary trigger Q${primary?.id ?? "?"}. Directional signal is ${direction} and confidence is ${confidenceScore}/10 based on evidence quality.`;
 
   const summary: string[] = [
     `Executive: ${executiveSummary}`,
-    `Primary: ${primaryCatalyst.reason}`,
-    `YES/NO tally: YES ${yesAnswers.length} | NO ${noAnswers.length}`,
-    `Confidence: ${confidenceScore}/10 (${confidenceLabel(confidenceScore)}).`,
+    `Primary Catalyst: ${primaryCatalyst.reason}`,
+    `YES/NO Tally: YES ${yesAnswers.length} | NO ${noAnswers.length} | Direction: ${direction}`,
+    `Confidence: ${confidenceScore}/10 (${confidenceLabel(confidenceScore)})`,
   ];
 
   const report: CatalystReport = {
@@ -366,10 +460,10 @@ export function buildCatalystInsight(snapshot: StockSnapshot): {
     analystAction,
     confidenceScore,
     confidenceRationale: confidenceLabel(confidenceScore),
-    questionAnswers: qa,
+    questionAnswers: answers,
     finalSynthesis,
     dataQualityNote:
-      "Current runtime uses Yahoo-linked market/news feeds and filing timestamps. Official NSE/BSE search endpoints are not directly queried in this build; unanswered checks default to NO.",
+      "Checklist uses available Yahoo-linked filing/news evidence and strict lookback filters. Missing evidence is marked NO by design (no hallucination).",
   };
 
   return {

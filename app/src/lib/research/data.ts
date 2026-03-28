@@ -1,5 +1,5 @@
 import yahooFinance from "yahoo-finance2";
-import { StockSnapshot } from "./types";
+import { FilingItem, StockSnapshot } from "./types";
 
 const yfClient = new yahooFinance();
 
@@ -138,6 +138,24 @@ function getNumberFromRecord(item: RecordLike, keys: string[]): number | null {
   return null;
 }
 
+function getStringFromRecord(item: RecordLike, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = item[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+    const nested = asRecord(value);
+    if (!nested) {
+      continue;
+    }
+    const fmt = nested.fmt;
+    if (typeof fmt === "string" && fmt.trim().length > 0) {
+      return fmt.trim();
+    }
+  }
+  return null;
+}
+
 function toSeriesLabel(dateString: string | null, fallback: string): string {
   if (!dateString) {
     return fallback;
@@ -183,6 +201,28 @@ export async function fetchStockSnapshot(symbol: string): Promise<StockSnapshot>
   const filings = asArray(quoteSummary.secFilings?.filings)
     .map((item) => asRecord(item))
     .filter((item): item is RecordLike => item !== null);
+
+  const recentFilings: FilingItem[] = [];
+  for (const item of filings) {
+    if (recentFilings.length >= 20) {
+      break;
+    }
+    const date = getDateFromRecord(item, ["date", "epochDate", "maxAge"]);
+    if (!date) {
+      continue;
+    }
+    const title =
+      getStringFromRecord(item, ["title", "headline", "type", "description", "reason"])
+      ?? "Corporate filing";
+    const url = getStringFromRecord(item, ["url", "link"]);
+    recentFilings.push({
+      title,
+      date,
+      source: `NSE/BSE filing (${date})`,
+      url: url ?? undefined,
+    });
+  }
+
   const latestFilingDate = filings
     .map((item) => getDateFromRecord(item, ["date", "epochDate", "maxAge"]))
     .find((value) => value !== null) ?? null;
@@ -329,6 +369,7 @@ export async function fetchStockSnapshot(symbol: string): Promise<StockSnapshot>
     industry: quoteSummary.summaryProfile?.industry ?? null,
     businessSummary: quoteSummary.summaryProfile?.longBusinessSummary ?? null,
     latestFilingDate,
+    recentFilings,
     latestInsiderTransactionDate,
     insiderNetShares,
     priceHistory,
