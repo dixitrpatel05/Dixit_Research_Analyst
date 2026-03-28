@@ -1,0 +1,16 @@
+fastapi
+python-multipart
+uvicorn
+python-dotenv
+httpx
+pytesseract
+Pillow
+google-generativeai
+yfinance
+nsetools
+beautifulsoup4
+lxml
+weasyprint
+aiofiles
+tavily-python
+pandas
