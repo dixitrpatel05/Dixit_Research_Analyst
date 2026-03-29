@@ -16,4 +16,4 @@ if command -v apt-get >/dev/null 2>&1; then
 fi
 
 python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
+python3 -m pip install -r backend/requirements.txt

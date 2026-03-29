@@ -4,11 +4,42 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${PORT:-8000}"
 
-PYTHON_BIN="python3"
-if [[ -x "/app/.venv/bin/python" ]]; then
-	PYTHON_BIN="/app/.venv/bin/python"
-elif [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
-	PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
+has_uvicorn() {
+	local pybin="$1"
+	"${pybin}" -c "import uvicorn" >/dev/null 2>&1
+}
+
+pick_python() {
+	local candidates=(
+		"/app/.venv/bin/python"
+		"/opt/venv/bin/python"
+		"${ROOT_DIR}/.venv/bin/python"
+		"$(command -v python3 || true)"
+	)
+
+	for py in "${candidates[@]}"; do
+		if [[ -n "${py}" && -x "${py}" ]] && has_uvicorn "${py}"; then
+			echo "${py}"
+			return 0
+		fi
+	done
+
+	# If no interpreter has uvicorn yet, fall back to first available python.
+	for py in "${candidates[@]}"; do
+		if [[ -n "${py}" && -x "${py}" ]]; then
+			echo "${py}"
+			return 0
+		fi
+	done
+
+	echo "python3"
+}
+
+PYTHON_BIN="$(pick_python)"
+
+if ! has_uvicorn "${PYTHON_BIN}"; then
+	echo "[start.sh] uvicorn missing for ${PYTHON_BIN}; installing backend requirements..."
+	"${PYTHON_BIN}" -m pip install --no-cache-dir -r "${ROOT_DIR}/backend/requirements.txt"
 fi
 
 echo "[start.sh] Using Python: ${PYTHON_BIN}"
