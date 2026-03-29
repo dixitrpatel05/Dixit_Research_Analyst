@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { UploadCloud } from "lucide-react";
 import { useRouter } from "next/navigation";
 
+import { apiFetch } from "../src/lib/apiClient";
 import { useAlphaStore } from "../src/store/useAlphaStore";
 
 type OcrResponse = {
@@ -56,7 +57,7 @@ export default function Home() {
         payload.append("manual_symbols", manualSymbols);
       }
 
-      const response = await fetch("/api/ocr", {
+      const response = await apiFetch("/ocr", {
         method: "POST",
         body: payload,
       });
@@ -76,8 +77,9 @@ export default function Home() {
       clearAll();
       setSymbols(extracted);
       router.push("/dashboard");
-    } catch {
-      setErrorMessage("Could not start analysis. Please try again.");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "Request failed";
+      setErrorMessage(`Could not start analysis (${text}). Please verify backend API URL config and retry.`);
     } finally {
       setIsSubmitting(false);
     }

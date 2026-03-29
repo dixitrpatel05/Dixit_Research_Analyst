@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 import { Moon, Plus, Sun } from "lucide-react";
 import { useRouter } from "next/navigation";
 
+import { apiFetch } from "../../src/lib/apiClient";
 import StockRow from "../../src/components/StockRow";
 import { useAlphaStore } from "../../src/store/useAlphaStore";
 
@@ -96,7 +97,7 @@ export default function DashboardPage() {
     targetSymbols.forEach((sym) => setLoadingState(sym, "loading"));
 
     try {
-      const response = await fetch("/api/research/batch", {
+      const response = await apiFetch("/research/batch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ symbols: targetSymbols }),
@@ -220,7 +221,7 @@ export default function DashboardPage() {
   const handleDownloadPdf = async (symbol: string) => {
     setPdfLoadingMap((prev) => ({ ...prev, [symbol]: true }));
     try {
-      const response = await fetch(`/api/report/${symbol}/pdf`);
+      const response = await apiFetch(`/report/${symbol}/pdf`);
       if (!response.ok) throw new Error("PDF download failed");
 
       const blob = await response.blob();

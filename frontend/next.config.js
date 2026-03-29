@@ -16,17 +16,12 @@ function normalizeBaseUrl(value) {
 }
 
 function detectBackendBaseUrl() {
-  const direct =
+  const explicit =
     process.env.BACKEND_API_URL ||
     process.env.NEXT_PUBLIC_API_URL ||
     process.env.RAILWAY_BACKEND_URL;
-  if (direct) {
-    return normalizeBaseUrl(direct);
-  }
-
-  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL;
-  if (railwayDomain) {
-    return normalizeBaseUrl(railwayDomain);
+  if (explicit) {
+    return normalizeBaseUrl(explicit);
   }
 
   if (process.env.NODE_ENV === "development") {

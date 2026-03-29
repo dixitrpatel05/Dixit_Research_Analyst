@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { useParams } from "next/navigation";
 
+import { apiFetch } from "../../../src/lib/apiClient";
 import { useAlphaStore } from "../../../src/store/useAlphaStore";
 
 function inr(value: unknown): string {
@@ -45,7 +46,7 @@ export default function ReportPreviewPage() {
     let mounted = true;
     const fetchData = async () => {
       try {
-        const response = await fetch(`/api/research/${symbol}`, { method: "POST" });
+        const response = await apiFetch(`/research/${symbol}`, { method: "POST" });
         if (!response.ok) return;
         const payload = (await response.json()) as Record<string, any>;
         if (mounted) setApiData(payload);
@@ -73,7 +74,7 @@ export default function ReportPreviewPage() {
     if (!symbol || isDownloading) return;
     setIsDownloading(true);
     try {
-      const response = await fetch(`/api/report/${symbol}/pdf`);
+      const response = await apiFetch(`/report/${symbol}/pdf`);
       if (!response.ok) throw new Error("PDF generation failed");
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
