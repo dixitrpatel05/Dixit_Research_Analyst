@@ -93,7 +93,11 @@ export default function ReportPreviewPage() {
   };
 
   const peers = Array.isArray(report?.inputs?.peers) ? report.inputs.peers : [];
-  const filings = Array.isArray(report?.inputs?.announcements) ? report.inputs.announcements : [];
+  const filings = Array.isArray(report?.inputs?.recent_filings)
+    ? report.inputs.recent_filings
+    : Array.isArray(report?.inputs?.announcements)
+      ? report.inputs.announcements
+      : [];
   const risks = Array.isArray(sectorRisk?.top_risks) ? sectorRisk.top_risks : [];
 
   return (
@@ -184,6 +188,13 @@ export default function ReportPreviewPage() {
                     <td className="border border-slate-200 px-2 py-2">{String(f?.headline || "NA")}</td>
                   </tr>
                 ))}
+                {!filings.length ? (
+                  <tr>
+                    <td className="border border-slate-200 px-2 py-2 text-slate-500" colSpan={3}>
+                      No filings detected in the last 90 days.
+                    </td>
+                  </tr>
+                ) : null}
               </tbody>
             </table>
           </div>

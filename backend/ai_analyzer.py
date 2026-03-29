@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 try:
@@ -179,6 +180,35 @@ def _safe_num(value: Any) -> float | None:
         return None
 
 
+def _parse_any_date(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    for fmt in (
+        "%d-%b-%Y %H:%M:%S",
+        "%d-%b-%Y",
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+    ):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def _heuristic_catalyst_fallback(
     symbol: str,
     company_name: str,
@@ -189,9 +219,21 @@ def _heuristic_catalyst_fallback(
     insider_trades: list[dict],
     news_articles: list[dict],
 ) -> dict:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+    announcements_recent = [
+        a for a in announcements if _parse_any_date((a or {}).get("date")) is None or _parse_any_date((a or {}).get("date")) >= cutoff
+    ]
+    news_recent = [
+        n
+        for n in news_articles
+        if _parse_any_date((n or {}).get("published_date") or (n or {}).get("date")) is None
+        or _parse_any_date((n or {}).get("published_date") or (n or {}).get("date")) >= cutoff
+    ]
+
     catalyst_type = "OTHER"
     headline = "No confirmed single catalyst yet"
     evidence: list[str] = []
+    catalyst_date = "NA"
 
     if bulk_deals:
         catalyst_type = "INSTITUTIONAL_BUYING"
@@ -201,14 +243,16 @@ def _heuristic_catalyst_fallback(
         catalyst_type = "INSIDER_BUY"
         headline = "Insider activity signaling management confidence"
         evidence.append(f"{len(insider_trades)} insider-trade records were available")
-    if announcements:
-        top = str((announcements[0] or {}).get("type") or "OTHER").upper()
+    if announcements_recent:
+        top_row = announcements_recent[0] or {}
+        top = str(top_row.get("type") or "OTHER").upper()
         if top in {"ORDER_WIN", "CAPEX", "RESULTS", "BUYBACK", "BONUS"}:
             catalyst_type = top if top != "RESULTS" else "RESULTS_BEAT"
             headline = f"Recent {top.replace('_', ' ').title()} disclosure supporting rerating"
-        evidence.append(f"{len(announcements)} corporate announcements available in last 90 days")
-    if news_articles:
-        evidence.append(f"{len(news_articles)} relevant news references captured")
+        catalyst_date = str(top_row.get("date") or "NA")
+        evidence.append(f"{len(announcements_recent)} corporate announcements available in last 90 days")
+    if news_recent:
+        evidence.append(f"{len(news_recent)} relevant news references captured in last 90 days")
 
     vs_200dma = _safe_num(fundamentals.get("price_vs_200dma"))
     rev_growth = _safe_num(fundamentals.get("revenue_growth_yoy"))
@@ -224,8 +268,8 @@ def _heuristic_catalyst_fallback(
         confidence += 8 if roe > 15 else 3 if roe > 10 else -2
     if debt_equity is not None:
         confidence += 5 if debt_equity < 0.7 else 1 if debt_equity < 1.5 else -4
-    confidence += min(10, len(news_articles)) // 2
-    confidence += min(8, len(announcements)) // 2
+    confidence += min(10, len(news_recent)) // 2
+    confidence += min(8, len(announcements_recent)) // 2
     confidence += min(6, len(bulk_deals))
     confidence = max(35, min(82, int(confidence)))
 
@@ -240,7 +284,7 @@ def _heuristic_catalyst_fallback(
             catalyst_type = "MANAGEMENT_UPGRADE"
             headline = "Quality balance-sheet profile attracting revaluation"
 
-    data_points = [announcements, bulk_deals, insider_trades, news_articles]
+    data_points = [announcements_recent, bulk_deals, insider_trades, news_recent]
     non_empty = sum(1 for p in data_points if p)
     quality = "HIGH" if non_empty >= 3 else "MEDIUM" if non_empty >= 2 else "LOW"
 
@@ -261,7 +305,7 @@ def _heuristic_catalyst_fallback(
     return {
         "catalyst_type": catalyst_type,
         "catalyst_headline": headline,
-        "catalyst_date": "NA",
+        "catalyst_date": catalyst_date,
         "catalyst_detail": detail,
         "supporting_evidence": evidence,
         "confidence_score": confidence,
@@ -344,6 +388,8 @@ def _catalyst_prompt(
 
     return f"""You are a senior equity research analyst at a top Indian institutional brokerage. I will give you raw data about a stock. Your task is to identify the PRIMARY catalyst driving the recent price upmove.
 
+STRICT TIME RULE: Use only catalysts from the latest 90 days. Ignore FY24/old historical events unless they had a fresh disclosure in the last 90 days.
+
 STOCK: {symbol} — {company_name}
 SECTOR: {sector}
 PRICE PERFORMANCE: CMP ₹{cmp_value}, 52W High ₹{high_52w}, 52W Low ₹{low_52w}, vs 200DMA: {vs_200dma}%
@@ -357,7 +403,7 @@ BULK/BLOCK DEALS (last 30 days):
 INSIDER TRADING:
 {_compact_json(insider_slim)}
 
-RECENT NEWS:
+RECENT NEWS (prefer last 90 days):
 {_compact_json(news_slim)}
 
 Based on all this data, return a JSON object with EXACTLY these fields:
@@ -372,6 +418,7 @@ Based on all this data, return a JSON object with EXACTLY these fields:
   "secondary_catalysts": array of 2 short strings for additional tailwinds,
   "data_quality": one of [HIGH, MEDIUM, LOW] based on how much data was available
 }}
+If there is no valid catalyst in the last 90 days, set catalyst_type="OTHER", confidence_score<=45, and explain data limitation.
 Return ONLY valid JSON, no markdown."""
 
 
@@ -420,6 +467,8 @@ COMPANY: {company_name}, SECTOR: {sector}, SUB-SECTOR: {sub_sector}
 
 RECENT SECTOR NEWS:
 {_compact_json(news_slim)}
+
+Use only last 90-day evidence. Avoid generic statements; tie each risk/tailwind to current India market context and recent disclosures/news.
 
 Provide analysis JSON:
 {{
@@ -557,16 +606,44 @@ async def analyze_stock_with_gemini(
         )
 
     if not sector_risk:
+        trend = _safe_num(fundamentals.get("price_vs_200dma"))
+        rev = _safe_num(fundamentals.get("revenue_growth_yoy"))
+        if trend is not None and trend > 8 and rev is not None and rev > 8:
+            outlook = "BULLISH"
+            stage = "MID_UPCYCLE"
+        elif trend is not None and trend < -5:
+            outlook = "BEARISH"
+            stage = "EARLY_DOWNCYCLE"
+        else:
+            outlook = "NEUTRAL"
+            stage = "MID_UPCYCLE"
+
         sector_risk = {
-            "sector_cycle_stage": "MID_UPCYCLE",
-            "sector_outlook": "NEUTRAL",
-            "sector_tailwinds": ["Domestic demand", "Policy support", "Cost normalization"],
-            "government_schemes": [],
-            "global_cues": "Global commodity and rates environment remain mixed.",
+            "sector_cycle_stage": stage,
+            "sector_outlook": outlook,
+            "sector_tailwinds": [
+                f"Recent demand signal for {sector} from last-quarter disclosures",
+                "Domestic liquidity and participation remain supportive",
+                "Earnings revisions can drive rerating when delivery sustains",
+            ],
+            "government_schemes": ["Budget capex pipeline", "PLI-linked manufacturing support"],
+            "global_cues": "US rates, crude trend, and global risk appetite remain key external drivers over next 1-2 quarters.",
             "top_risks": [
-                {"risk_title": "Demand volatility", "risk_detail": "Demand swings can impact earnings visibility.", "severity": "MEDIUM"},
-                {"risk_title": "Input costs", "risk_detail": "Input costs can compress margins in weaker cycles.", "severity": "MEDIUM"},
-                {"risk_title": "Policy shifts", "risk_detail": "Regulatory changes may alter profitability assumptions.", "severity": "LOW"},
+                {
+                    "risk_title": "Execution slippage",
+                    "risk_detail": "Project/order execution delays can weaken near-term earnings delivery.",
+                    "severity": "MEDIUM",
+                },
+                {
+                    "risk_title": "Margin pressure",
+                    "risk_detail": "Input cost or pricing pressure may impact EBITDA trajectory.",
+                    "severity": "MEDIUM",
+                },
+                {
+                    "risk_title": "Regulatory surprise",
+                    "risk_detail": "Any policy shift may alter growth assumptions for the sector.",
+                    "severity": "LOW",
+                },
             ],
             "investment_horizon": "MEDIUM_TERM",
             "sector_leader_or_laggard": "MID",

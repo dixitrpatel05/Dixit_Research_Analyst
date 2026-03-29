@@ -1,18 +1,1 @@
-fastapi
-python-multipart
-uvicorn
-python-dotenv
-httpx
-pytesseract
-Pillow
-google-generativeai
-google-genai
-yfinance
-nsetools
-beautifulsoup4
-lxml
-weasyprint
-reportlab
-aiofiles
-tavily-python
-pandas
+-r backend/requirements.txt

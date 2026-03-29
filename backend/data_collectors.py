@@ -395,6 +395,7 @@ async def nse_insider_trading(symbol: str) -> list[dict]:
         if not isinstance(rows, list):
             return []
 
+        cutoff = datetime.now() - timedelta(days=90)
         output: list[dict] = []
         for item in rows:
             if not isinstance(item, dict):
@@ -405,6 +406,8 @@ async def nse_insider_trading(symbol: str) -> list[dict]:
                 continue
             raw_date = item.get("date") or item.get("broadcastDt") or item.get("an_dt")
             dt = _parse_date(str(raw_date) if raw_date is not None else None)
+            if dt and dt < cutoff:
+                continue
 
             qty = _safe_float(item.get("qty") or item.get("quantity") or item.get("shares"))
             value_lakh = _safe_float(item.get("value") or item.get("valueLakh") or item.get("amount"))
@@ -434,52 +437,76 @@ async def bse_announcements(bse_code: str) -> list[dict]:
     Fetch BSE announcements and return the latest significant items.
     """
     try:
-        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-        url = (
-            "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-            f"?pageno=1&strCat=-1&strPrevDate={date_str}&strScrip={bse_code}"
-            f"&strSearch=P&strToDate={date_str}&strType=C"
-        )
+        # BSE endpoint works best with a date range, not same-day only.
+        # Using last 90 days to align with catalyst relevance constraints.
+        code = (bse_code or "").strip()
+        if not code or not code.isdigit():
+            return []
+
+        to_dt = datetime.now(timezone.utc)
+        from_dt = to_dt - timedelta(days=90)
+        date_variants = [
+            (from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")),
+            (from_dt.strftime("%d/%m/%Y"), to_dt.strftime("%d/%m/%Y")),
+        ]
+
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://www.bseindia.com/",
         }
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-
-        body = resp.text.strip()
-        parsed: Any
-        try:
-            parsed = resp.json()
-        except Exception:
-            # Some responses can be HTML wrappers around JSON/script payloads.
-            soup = BeautifulSoup(body, "lxml")
-            text = soup.get_text(" ", strip=True)
-            json_match = re.search(r"(\{.*\}|\[.*\])", text)
-            parsed = json.loads(json_match.group(1)) if json_match else []
-
-        rows = parsed.get("Table", parsed.get("table", parsed)) if isinstance(parsed, dict) else parsed
-        if not isinstance(rows, list):
-            return []
-
+        cutoff = datetime.now() - timedelta(days=90)
         output: list[dict] = []
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            headline = str(item.get("HEADLINE") or item.get("News_Sub") or item.get("SUBCATNAME") or "").strip()
-            raw_date = item.get("NEWS_DT") or item.get("DissemDT") or item.get("DATE")
-            dt = _parse_date(str(raw_date) if raw_date is not None else None)
-            if not headline:
-                continue
-            output.append(
-                {
-                    "date": _stringify_date(dt) or (str(raw_date) if raw_date else None),
-                    "headline": headline,
-                    "url": item.get("ATTACHMENTNAME") or item.get("NSURL") or item.get("Attachment"),
-                }
-            )
+
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            for prev_date, to_date in date_variants:
+                url = (
+                    "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+                    f"?pageno=1&strCat=-1&strPrevDate={prev_date}&strScrip={code}"
+                    f"&strSearch=P&strToDate={to_date}&strType=C"
+                )
+
+                try:
+                    resp = await client.get(url, headers=headers)
+                    resp.raise_for_status()
+                except Exception:
+                    continue
+
+                body = resp.text.strip()
+                parsed: Any
+                try:
+                    parsed = resp.json()
+                except Exception:
+                    # Some responses can be HTML wrappers around JSON/script payloads.
+                    soup = BeautifulSoup(body, "lxml")
+                    text = soup.get_text(" ", strip=True)
+                    json_match = re.search(r"(\{.*\}|\[.*\])", text)
+                    parsed = json.loads(json_match.group(1)) if json_match else []
+
+                rows = parsed.get("Table", parsed.get("table", parsed)) if isinstance(parsed, dict) else parsed
+                if not isinstance(rows, list):
+                    continue
+
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    headline = str(item.get("HEADLINE") or item.get("News_Sub") or item.get("SUBCATNAME") or "").strip()
+                    raw_date = item.get("NEWS_DT") or item.get("DissemDT") or item.get("DATE")
+                    dt = _parse_date(str(raw_date) if raw_date is not None else None)
+                    if dt and dt < cutoff:
+                        continue
+                    if not headline:
+                        continue
+                    output.append(
+                        {
+                            "date": _stringify_date(dt) or (str(raw_date) if raw_date else None),
+                            "headline": headline,
+                            "url": item.get("ATTACHMENTNAME") or item.get("NSURL") or item.get("Attachment"),
+                        }
+                    )
+
+                if output:
+                    break
 
         return output[:10]
     except Exception:

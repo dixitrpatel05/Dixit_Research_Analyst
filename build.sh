@@ -15,5 +15,10 @@ if command -v apt-get >/dev/null 2>&1; then
 	rm -rf /var/lib/apt/lists/*
 fi
 
-python3 -m pip install --upgrade pip
-python3 -m pip install -r backend/requirements.txt
+PYTHON_BIN="python3"
+if [[ -x "/app/.venv/bin/python" ]]; then
+	PYTHON_BIN="/app/.venv/bin/python"
+fi
+
+"${PYTHON_BIN}" -m pip install --upgrade pip
+"${PYTHON_BIN}" -m pip install -r backend/requirements.txt

@@ -99,10 +99,28 @@ def _bar(value: float | None, max_value: float) -> float:
 
 
 def _latest_announcements(report: dict, limit: int = 10) -> list[dict]:
-    anns = (report.get("inputs") or {}).get("announcements") or []
-    if not isinstance(anns, list):
-        return []
-    return [a for a in anns if isinstance(a, dict)][:limit]
+  inputs = report.get("inputs") or {}
+  recent = inputs.get("recent_filings") or []
+  if isinstance(recent, list) and recent:
+    return [a for a in recent if isinstance(a, dict)][:limit]
+
+  anns = inputs.get("announcements") or []
+  bse = inputs.get("bse_announcements") or []
+  merged: list[dict] = []
+  if isinstance(anns, list):
+    merged.extend([a for a in anns if isinstance(a, dict)])
+  if isinstance(bse, list):
+    for row in bse:
+      if not isinstance(row, dict):
+        continue
+      merged.append(
+        {
+          "date": row.get("date"),
+          "type": "BSE_ANNOUNCEMENT",
+          "headline": row.get("headline") or "BSE corporate filing",
+        }
+      )
+  return merged[:limit]
 
 
 def _latest_deals(report: dict, limit: int = 8) -> list[dict]:
@@ -354,7 +372,7 @@ def generate_report_html(report: dict) -> str:
         {''.join(
             f'<tr class="{"flag" if str(r.get("type", "")).upper() in {"INSIDER_TRADE", "QIP"} else ""}"><td>{escape(str(r.get("date") or "NA"))}</td><td>{escape(str(r.get("type") or "NA"))}</td><td>{escape(str(r.get("headline") or "NA"))}</td></tr>'
             for r in ann_rows
-        )}
+        ) if ann_rows else '<tr><td>NA</td><td>NA</td><td>No recent filings found in the last 90 days</td></tr>'}
       </tbody>
     </table>
 

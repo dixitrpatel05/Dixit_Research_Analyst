@@ -113,7 +113,11 @@ export default function StockRow({
 
   const promoterConcern = Boolean(fundamentalsAI?.promoter_concern) || Number(fundamentals?.promoter_pledge || 0) > 10;
 
-  const filings: Array<Record<string, any>> = Array.isArray(data?.inputs?.announcements) ? data.inputs.announcements : [];
+  const filings: Array<Record<string, any>> = Array.isArray(data?.inputs?.recent_filings)
+    ? data.inputs.recent_filings
+    : Array.isArray(data?.inputs?.announcements)
+      ? data.inputs.announcements
+      : [];
   const risks: Array<Record<string, any>> = Array.isArray(sectorRisk?.top_risks) ? sectorRisk.top_risks : [];
   const peers: Array<Record<string, any>> = Array.isArray(data?.inputs?.peers) ? data.inputs.peers : [];
   const evidence: string[] = Array.isArray(catalyst?.supporting_evidence) ? catalyst.supporting_evidence : [];
@@ -331,6 +335,13 @@ export default function StockRow({
                           </tr>
                         );
                       })}
+                      {!filings.length ? (
+                        <tr>
+                          <td className="px-2 py-2 text-gray-400" colSpan={3}>
+                            No filings detected in the last 90 days.
+                          </td>
+                        </tr>
+                      ) : null}
                     </tbody>
                   </table>
                 </div>

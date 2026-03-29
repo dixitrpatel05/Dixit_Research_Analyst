@@ -138,6 +138,86 @@ def _extract_symbols_from_text(text: str) -> list[str]:
     return out
 
 
+def _parse_any_date(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    formats = [
+        "%d-%b-%Y %H:%M:%S",
+        "%d-%b-%Y",
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _filter_recent_items(items: list[dict], date_keys: tuple[str, ...], days: int = 90) -> list[dict]:
+    cutoff = _now_utc() - timedelta(days=days)
+    out: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        dt = None
+        for key in date_keys:
+            dt = _parse_any_date(item.get(key))
+            if dt is not None:
+                break
+        if dt is None or dt >= cutoff:
+            out.append(item)
+
+    def _sort_key(entry: dict) -> datetime:
+        for key in date_keys:
+            dt = _parse_any_date(entry.get(key))
+            if dt is not None:
+                return dt
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    return sorted(out, key=_sort_key, reverse=True)
+
+
+def _extract_symbol_price_rows_from_text(text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip().upper()
+        if not line:
+            continue
+        # Match common watchlist rows like: RELIANCE 1,234.50 or NSE:INFY 1732
+        m = re.search(r"\b(?:NSE:|BSE:)?([A-Z][A-Z0-9]{1,9})\b[^0-9]{0,10}([0-9][0-9,]*\.?[0-9]{0,2})", line)
+        if not m:
+            continue
+        symbol = _normalize_symbol(m.group(1))
+        if not _is_likely_symbol(symbol):
+            continue
+        price_raw = (m.group(2) or "").replace(",", "").strip()
+        try:
+            price = float(price_raw)
+        except Exception:
+            price = None
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        rows.append({"symbol": symbol, "ocr_price": price})
+    return rows
+
+
 def _prepare_image_variants(image: Image.Image) -> list[Image.Image]:
     base = image.convert("RGB")
     w, h = base.size
@@ -198,6 +278,28 @@ def _extract_symbols_with_tesseract(image: Image.Image) -> list[str]:
             if len(candidates) >= 8:
                 return candidates
     return candidates
+
+
+def _extract_rows_with_tesseract(image: Image.Image) -> list[dict[str, Any]]:
+    best_rows: list[dict[str, Any]] = []
+    configs = [
+        "--psm 6 --oem 3",
+        "--psm 11 --oem 3",
+        "--psm 4 --oem 3",
+    ]
+
+    for variant in _prepare_image_variants(image):
+        for cfg in configs:
+            try:
+                text = pytesseract.image_to_string(variant, config=cfg)
+            except Exception:
+                continue
+            rows = _extract_symbol_price_rows_from_text(text)
+            if len(rows) > len(best_rows):
+                best_rows = rows
+            if len(best_rows) >= 6:
+                return best_rows
+    return best_rows
 
 
 def _extract_symbols_from_model_text(raw: str) -> list[str]:
@@ -316,6 +418,66 @@ def _extract_symbols_from_image_bytes(content: bytes) -> list[str]:
     return _extract_symbols_with_gemini_vision(image)
 
 
+def _extract_symbol_rows_from_image_bytes(content: bytes) -> list[dict[str, Any]]:
+    try:
+        image = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception:
+        return []
+
+    rows = _extract_rows_with_tesseract(image)
+    if rows:
+        return rows
+
+    # Fallback to symbol-only Gemini vision and preserve schema.
+    symbols = _extract_symbols_with_gemini_vision(image)
+    return [{"symbol": s, "ocr_price": None} for s in symbols]
+
+
+async def _verify_symbol_candidate(symbol: str, ocr_price: float | None) -> dict[str, Any]:
+    requested = _normalize_symbol(symbol)
+    resolved = requested
+
+    fundamentals = await yfinance_fundamentals(requested)
+    cmp_value = fundamentals.get("cmp")
+    if cmp_value is None:
+        maybe = await resolve_symbol_candidate(requested)
+        if maybe and maybe != requested:
+            alt = await yfinance_fundamentals(maybe)
+            if alt.get("cmp") is not None:
+                resolved = maybe
+                fundamentals = alt
+                cmp_value = alt.get("cmp")
+
+    live_price = float(cmp_value) if isinstance(cmp_value, (int, float)) else None
+    price_diff_pct = None
+    if ocr_price is not None and live_price not in (None, 0):
+        try:
+            price_diff_pct = ((live_price - float(ocr_price)) / float(ocr_price)) * 100.0 if float(ocr_price) else None
+        except Exception:
+            price_diff_pct = None
+
+    is_valid = live_price is not None
+    price_match = price_diff_pct is None or abs(price_diff_pct) <= 22.0
+    confidence = 0.4
+    if is_valid:
+        confidence += 0.35
+    if requested != resolved:
+        confidence -= 0.05
+    if price_match:
+        confidence += 0.2
+
+    return {
+        "symbol": requested,
+        "resolved_symbol": resolved,
+        "ocr_price": ocr_price,
+        "live_price": live_price,
+        "price_diff_pct": price_diff_pct,
+        "valid": is_valid,
+        "price_match": price_match,
+        "confidence": round(max(0.0, min(1.0, confidence)), 2),
+    }
+
+
 def _parse_manual_symbols(manual_symbols: str | None) -> list[str]:
     if not manual_symbols:
         return []
@@ -385,7 +547,8 @@ async def _collect_news_with_fallback(symbol: str, company_name: str) -> tuple[l
     gnews_items = gnews_res if isinstance(gnews_res, list) else []
 
     if tavily_items:
-        return tavily_items, {
+        filtered = _filter_recent_items(tavily_items, ("published_date", "date"), days=90)
+        return filtered or tavily_items[:10], {
             "selected": "tavily",
             "tavily": "ok",
             "newsdata": "ok" if newsdata_items else "empty",
@@ -405,7 +568,8 @@ async def _collect_news_with_fallback(symbol: str, company_name: str) -> tuple[l
             for n in newsdata_items
             if isinstance(n, dict)
         ]
-        return normalized, {
+        filtered = _filter_recent_items(normalized, ("published_date", "pubDate", "date"), days=90)
+        return filtered or normalized[:10], {
             "selected": "newsdata",
             "tavily": "empty",
             "newsdata": "ok",
@@ -413,7 +577,8 @@ async def _collect_news_with_fallback(symbol: str, company_name: str) -> tuple[l
         }
 
     if gnews_items:
-        return gnews_items, {
+        filtered = _filter_recent_items(gnews_items, ("published_date", "date"), days=90)
+        return filtered or gnews_items[:10], {
             "selected": "gnews",
             "tavily": "empty",
             "newsdata": "empty",
@@ -447,12 +612,19 @@ async def run_research_pipeline(symbol: str) -> dict:
                 fundamentals = candidate
     company_name = str(fundamentals.get("company_name") or symbol)
     sector = str(fundamentals.get("sector") or "Unknown")
-    sub_sector = str((fundamentals.get("_raw_info") or {}).get("industry") or "Unknown")
+    raw_info = fundamentals.get("_raw_info") or {}
+    sub_sector = str(raw_info.get("industry") or "Unknown")
+
+    bse_code = (
+        str(raw_info.get("bseCode") or raw_info.get("BSE") or raw_info.get("securityId") or "").strip()
+    )
+    if not bse_code.isdigit():
+        bse_code = ""
 
     announcements_task = nse_announcements(symbol)
     bulk_task = nse_bulk_block_deals(symbol)
     insider_task = nse_insider_trading(symbol)
-    bse_task = bse_announcements(str((fundamentals.get("_raw_info") or {}).get("exchange") or ""))
+    bse_task = bse_announcements(bse_code)
     peers_task = get_peer_data(symbol, sector)
     news_task = _collect_news_with_fallback(symbol, company_name)
 
@@ -479,6 +651,11 @@ async def run_research_pipeline(symbol: str) -> dict:
     bse_items = bse_res if isinstance(bse_res, list) else []
     peers = peers_res if isinstance(peers_res, list) else []
 
+    announcements = _filter_recent_items(announcements, ("date",), days=90)
+    bulk_deals = _filter_recent_items(bulk_deals, ("date",), days=30)
+    insider_trades = _filter_recent_items(insider_trades, ("date",), days=90)
+    bse_items = _filter_recent_items(bse_items, ("date",), days=90)
+
     if isinstance(news_bundle, tuple) and len(news_bundle) == 2:
         news_articles = news_bundle[0] if isinstance(news_bundle[0], list) else []
         news_health = news_bundle[1] if isinstance(news_bundle[1], dict) else {}
@@ -492,6 +669,27 @@ async def run_research_pipeline(symbol: str) -> dict:
         }
 
     sector_news = news_articles[:10]
+
+    recent_filings: list[dict[str, Any]] = []
+    for row in announcements[:20]:
+        recent_filings.append(
+            {
+                "date": row.get("date"),
+                "type": row.get("type") or "NSE",
+                "headline": row.get("headline") or "NSE corporate filing",
+                "source": "NSE",
+            }
+        )
+    for row in bse_items[:20]:
+        recent_filings.append(
+            {
+                "date": row.get("date"),
+                "type": "BSE_ANNOUNCEMENT",
+                "headline": row.get("headline") or "BSE corporate filing",
+                "source": "BSE",
+            }
+        )
+    recent_filings = _filter_recent_items(recent_filings, ("date",), days=90)[:20]
 
     ai_result = await analyze_stock_with_gemini(
         symbol=symbol,
@@ -521,6 +719,7 @@ async def run_research_pipeline(symbol: str) -> dict:
         "inputs": {
             **(ai_result.get("inputs") or {}),
             "bse_announcements": bse_items,
+            "recent_filings": recent_filings,
         },
         "source_health": {
             "yfinance": "ok" if fundamentals.get("cmp") is not None else "partial",
@@ -544,12 +743,18 @@ async def ocr_extract_symbols(
     manual_symbols: str | None = Form(default=None),
 ) -> JSONResponse:
     symbols: list[str] = []
+    ocr_rows: list[dict[str, Any]] = []
 
     if file is not None:
         try:
             content = await file.read()
+            ocr_rows = await asyncio.to_thread(_extract_symbol_rows_from_image_bytes, content)
             ocr_symbols = await asyncio.to_thread(_extract_symbols_from_image_bytes, content)
             symbols.extend(ocr_symbols)
+            for row in ocr_rows:
+                sym = _normalize_symbol(str(row.get("symbol") or ""))
+                if _is_likely_symbol(sym) and sym not in symbols:
+                    symbols.append(sym)
         except Exception:
             # Do not fail if OCR fails; manual input can still proceed.
             pass
@@ -559,7 +764,44 @@ async def ocr_extract_symbols(
         if sym not in symbols:
             symbols.append(sym)
 
-    return JSONResponse(content={"symbols": symbols})
+    verified_rows: list[dict[str, Any]] = []
+    if symbols:
+        ocr_price_map = {
+            _normalize_symbol(str(r.get("symbol") or "")): r.get("ocr_price")
+            for r in ocr_rows
+            if isinstance(r, dict)
+        }
+        verify_targets = symbols[:20]
+        verified_rows = await asyncio.gather(
+            *[_verify_symbol_candidate(sym, ocr_price_map.get(sym)) for sym in verify_targets],
+            return_exceptions=False,
+        )
+
+        verified_rows = sorted(
+            [r for r in verified_rows if isinstance(r, dict)],
+            key=lambda r: (r.get("valid") is True, r.get("price_match") is True, r.get("confidence", 0.0)),
+            reverse=True,
+        )
+
+        prioritized: list[str] = []
+        for row in verified_rows:
+            resolved = _normalize_symbol(str(row.get("resolved_symbol") or row.get("symbol") or ""))
+            if _is_likely_symbol(resolved) and resolved not in prioritized:
+                if row.get("valid") is True:
+                    prioritized.append(resolved)
+
+        for sym in manual:
+            if sym not in prioritized:
+                prioritized.append(sym)
+
+        # Keep limited fallback symbols to avoid noisy false positives.
+        for sym in symbols:
+            if sym not in prioritized and len(prioritized) < 12:
+                prioritized.append(sym)
+
+        symbols = prioritized
+
+    return JSONResponse(content={"symbols": symbols, "rows": verified_rows})
 
 
 @app.post("/api/research/batch")

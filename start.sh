@@ -46,4 +46,10 @@ echo "[start.sh] Using Python: ${PYTHON_BIN}"
 echo "[start.sh] Starting API on 0.0.0.0:${PORT}"
 
 cd "${ROOT_DIR}/backend"
+echo "[start.sh] Preflight: importing backend main module"
+"${PYTHON_BIN}" -c "import main" || {
+	echo "[start.sh] Preflight import failed; exiting before uvicorn boot"
+	exit 1
+}
+
 exec "${PYTHON_BIN}" -m uvicorn main:app --host 0.0.0.0 --port "${PORT}"
