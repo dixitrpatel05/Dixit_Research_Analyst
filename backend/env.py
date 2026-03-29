@@ -26,6 +26,9 @@ _ALIASES: dict[str, tuple[str, ...]] = {
         "GOOGLE_API_KEY",
         "GOOGLE_GENERATIVE_AI_API_KEY",
     ),
+    "groq": (
+        "GROQ_API_KEY",
+    ),
     "tavily": (
         "TAVILY_API_KEY",
         "TAVILY_KEY",

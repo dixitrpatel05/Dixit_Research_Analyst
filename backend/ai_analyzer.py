@@ -12,13 +12,28 @@ try:
 except Exception:
     genai_legacy = None
 
+try:
+    from groq import Groq as GroqClient
+except Exception:
+    GroqClient = None
+
 from env import get_backend_key
 
 _gemini_api_key = get_backend_key("gemini")
+_groq_api_key = get_backend_key("groq")
 MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-1.5-flash"]
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 client_new = None
 model_legacy = None
+groq_client = None
+
+if _groq_api_key and GroqClient is not None:
+    try:
+        groq_client = GroqClient(api_key=_groq_api_key)
+    except Exception:
+        groq_client = None
+
 if _gemini_api_key and genai_new is not None:
     try:
         client_new = genai_new.Client(api_key=_gemini_api_key)
@@ -36,9 +51,12 @@ if _gemini_api_key and genai_legacy is not None:
 def ai_client_status() -> dict:
     return {
         "api_key_present": bool(_gemini_api_key),
+        "groq_api_key_present": bool(_groq_api_key),
+        "groq_ready": groq_client is not None,
         "google_genai_ready": client_new is not None,
         "google_generativeai_ready": model_legacy is not None,
         "model_candidates": MODEL_CANDIDATES,
+        "groq_model": GROQ_MODEL if groq_client is not None else None,
     }
 
 
@@ -66,8 +84,8 @@ def _safe_json_load(text: str) -> dict:
 
 
 def call_gemini(prompt: str) -> dict:
-    """Call Gemini and parse JSON response with retry logic."""
-    if client_new is None and model_legacy is None:
+    """Call Groq (primary) then Gemini (fallback) with retry logic and JSON parsing."""
+    if groq_client is None and client_new is None and model_legacy is None:
         return {}
 
     def _wrap(payload: dict, source: str, model_name: str) -> dict:
@@ -76,6 +94,29 @@ def call_gemini(prompt: str) -> dict:
         out["_ai_model"] = model_name
         return out
 
+    # Try Groq first (faster, generous free tier)
+    if groq_client is not None:
+        try:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=2048,
+            )
+            text = response.choices[0].message.content or ""
+            parsed = _safe_json_load(text)
+            if parsed:
+                return _wrap(parsed, "groq", GROQ_MODEL)
+        except Exception as e:
+            # Log and continue to Gemini fallback
+            pass
+
+    # Fallback to Gemini with multi-model retry
     for attempt in range(3):
         try:
             if client_new is not None:
