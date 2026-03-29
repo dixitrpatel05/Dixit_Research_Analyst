@@ -15,6 +15,7 @@ except Exception:
 from env import get_backend_key
 
 _gemini_api_key = get_backend_key("gemini")
+MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
 client_new = None
 model_legacy = None
@@ -60,33 +61,42 @@ def call_gemini(prompt: str) -> dict:
     if client_new is None and model_legacy is None:
         return {}
 
+    def _wrap(payload: dict, source: str, model_name: str) -> dict:
+        out = dict(payload)
+        out["_ai_source"] = source
+        out["_ai_model"] = model_name
+        return out
+
     for attempt in range(3):
         try:
             if client_new is not None:
-                response = client_new.models.generate_content(
-                    model="gemini-1.5-flash",
-                    contents=prompt,
-                    config={
-                        "temperature": 0.1,
-                        "response_mime_type": "application/json",
-                    },
-                )
-                text = getattr(response, "text", "") or ""
-                parsed = _safe_json_load(text)
-                if parsed:
-                    return parsed
+                for model_name in MODEL_CANDIDATES:
+                    response = client_new.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config={
+                            "temperature": 0.1,
+                            "response_mime_type": "application/json",
+                        },
+                    )
+                    text = getattr(response, "text", "") or ""
+                    parsed = _safe_json_load(text)
+                    if parsed:
+                        return _wrap(parsed, "google.genai", model_name)
 
             if model_legacy is not None:
-                response = model_legacy.generate_content(
-                    prompt,
-                    generation_config=genai_legacy.types.GenerationConfig(
-                        temperature=0.1,
-                        response_mime_type="application/json",
-                    ),
-                )
-                parsed = _safe_json_load(getattr(response, "text", "") or "")
-                if parsed:
-                    return parsed
+                for model_name in MODEL_CANDIDATES:
+                    legacy_model = genai_legacy.GenerativeModel(model_name)
+                    response = legacy_model.generate_content(
+                        prompt,
+                        generation_config=genai_legacy.types.GenerationConfig(
+                            temperature=0.1,
+                            response_mime_type="application/json",
+                        ),
+                    )
+                    parsed = _safe_json_load(getattr(response, "text", "") or "")
+                    if parsed:
+                        return _wrap(parsed, "google.generativeai", model_name)
         except Exception:
             if attempt == 2:
                 return {}
@@ -218,6 +228,11 @@ def _heuristic_fundamental_fallback(company_name: str, sector: str, fundamentals
     else:
         rating = "STRONG_SELL"
 
+    cmp_value = _safe_num(fundamentals.get("cmp"))
+    # Convert fallback score into variable upside instead of constant 8%.
+    upside_pct = max(-18.0, min(32.0, (score - 52) * 0.85)) if cmp_value is not None else None
+    target_price = round(cmp_value * (1 + upside_pct / 100.0), 2) if cmp_value is not None and upside_pct is not None else target_default
+
     return {
         "business_description": f"{company_name} operates in {sector or 'its'} sector and was assessed using quantitative fallback scoring.",
         "revenue_trend": f"Revenue growth proxy is {rev_growth:.2f}% yoy." if rev_growth is not None else "Revenue trend could not be inferred.",
@@ -232,8 +247,8 @@ def _heuristic_fundamental_fallback(company_name: str, sector: str, fundamentals
         "key_concerns": ["Model fallback mode", "Limited narrative certainty"],
         "fundamental_score": score,
         "rating": rating,
-        "target_price": target_default,
-        "upside_pct": 8.0 if target_default is not None else None,
+        "target_price": target_price,
+        "upside_pct": upside_pct,
         "rating_rationale": "Fallback rating is now computed from revenue growth, ROE, leverage, and valuation proxies instead of static defaults.",
     }
 
@@ -479,6 +494,25 @@ async def analyze_stock_with_gemini(
             "sector_leader_or_laggard": "MID",
         }
 
+    ai_source = "heuristic"
+    ai_model = "none"
+    if isinstance(catalyst, dict) and catalyst.get("_ai_source"):
+        ai_source = str(catalyst.get("_ai_source"))
+        ai_model = str(catalyst.get("_ai_model") or "unknown")
+    elif isinstance(fundamentals_analysis, dict) and fundamentals_analysis.get("_ai_source"):
+        ai_source = str(fundamentals_analysis.get("_ai_source"))
+        ai_model = str(fundamentals_analysis.get("_ai_model") or "unknown")
+
+    if isinstance(catalyst, dict):
+        catalyst.pop("_ai_source", None)
+        catalyst.pop("_ai_model", None)
+    if isinstance(fundamentals_analysis, dict):
+        fundamentals_analysis.pop("_ai_source", None)
+        fundamentals_analysis.pop("_ai_model", None)
+    if isinstance(sector_risk, dict):
+        sector_risk.pop("_ai_source", None)
+        sector_risk.pop("_ai_model", None)
+
     return {
         "symbol": symbol,
         "company_name": company_name,
@@ -495,5 +529,10 @@ async def analyze_stock_with_gemini(
             "news_articles": news_articles,
             "peers": peers,
             "sector_news": sector_news,
+        },
+        "ai_pipeline": {
+            "source": ai_source,
+            "model": ai_model,
+            "fallback_used": ai_source == "heuristic",
         },
     }

@@ -470,50 +470,231 @@ def generate_pdf_bytes(report: dict) -> bytes:
   if canvas is None or A4 is None or simpleSplit is None:
     raise RuntimeError("PDF engine unavailable: install WeasyPrint dependencies or include reportlab fallback.")
 
-  # Lightweight fallback PDF renderer for environments missing WeasyPrint system libs.
+  # Rich fallback PDF renderer for environments missing WeasyPrint system libs.
   buffer = io.BytesIO()
   c = canvas.Canvas(buffer, pagesize=A4)
   width, height = A4
-  y = height - 50
+  y = height - 46
 
-  def write_line(text: str, size: int = 10, gap: int = 14) -> None:
+  def ensure_space(min_space: int = 60) -> None:
     nonlocal y
-    if y < 60:
+    if y < min_space:
       c.showPage()
-      y = height - 50
+      y = height - 46
+
+  def write_line(text: str, size: int = 10, gap: int = 14, x: int = 40) -> None:
+    nonlocal y
+    ensure_space(70)
     c.setFont("Helvetica", size)
-    c.drawString(40, y, text[:180])
+    c.drawString(x, y, text[:190])
     y -= gap
+
+  def write_wrapped(text: str, size: int = 10, gap: int = 13, x: int = 40, max_width: int | None = None) -> None:
+    nonlocal y
+    if max_width is None:
+      max_width = int(width - 80)
+    lines = simpleSplit(str(text or ""), "Helvetica", size, max_width)
+    if not lines:
+      write_line("NA", size=size, gap=gap, x=x)
+      return
+    for line in lines:
+      write_line(line, size=size, gap=gap, x=x)
+
+  def section(title: str) -> None:
+    nonlocal y
+    ensure_space(90)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(40, y, title)
+    y -= 10
+    c.setLineWidth(0.7)
+    c.line(40, y, width - 40, y)
+    y -= 14
+
+  def kv_row(left: str, right: str) -> None:
+    nonlocal y
+    ensure_space(80)
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(40, y, left)
+    c.setFont("Helvetica", 9)
+    write_wrapped(right, size=9, gap=11, x=170, max_width=int(width - 210))
+
+  def table(headers: list[str], rows: list[list[str]]) -> None:
+    nonlocal y
+    if not headers:
+      return
+    col_count = len(headers)
+    left = 40
+    right = width - 40
+    col_w = (right - left) / col_count
+
+    ensure_space(90)
+    c.setFont("Helvetica-Bold", 8)
+    for i, h in enumerate(headers):
+      c.drawString(left + i * col_w + 2, y, str(h)[:28])
+    y -= 10
+    c.setLineWidth(0.5)
+    c.line(left, y, right, y)
+    y -= 8
+
+    c.setFont("Helvetica", 8)
+    for row in rows:
+      ensure_space(70)
+      max_lines = 1
+      wrapped_cells: list[list[str]] = []
+      for i in range(col_count):
+        txt = str(row[i] if i < len(row) else "")
+        lines = simpleSplit(txt, "Helvetica", 8, col_w - 6)
+        if not lines:
+          lines = [""]
+        wrapped_cells.append(lines)
+        max_lines = max(max_lines, len(lines))
+
+      for line_idx in range(max_lines):
+        for i, lines in enumerate(wrapped_cells):
+          line = lines[line_idx] if line_idx < len(lines) else ""
+          c.drawString(left + i * col_w + 2, y, line[:36])
+        y -= 10
+      c.line(left, y + 4, right, y + 4)
+      y -= 2
 
   symbol = str(report.get("symbol") or "UNKNOWN")
   company = str(report.get("company_name") or symbol)
+  sector = str(report.get("sector") or "Unknown")
   fundamentals = report.get("fundamentals") or {}
   catalyst = report.get("catalyst_analysis") or {}
   fa = report.get("fundamental_analysis") or {}
+  sr = report.get("sector_risk_analysis") or {}
+  ann_rows = _latest_announcements(report, limit=12)
+  deals = _latest_deals(report, limit=10)
+  insider = _insider(report, limit=10)
+  peers = _peer_rows(report)
+  risks = sr.get("top_risks") if isinstance(sr.get("top_risks"), list) else []
 
-  write_line("AlphaDesk Research Report", 15, 20)
-  write_line(f"Company: {company} ({symbol})", 11)
-  write_line(f"Generated: {datetime.utcnow().strftime('%d-%b-%Y %H:%M UTC')}", 9, 18)
+  # Cover and summary section
+  c.setFont("Helvetica-Bold", 22)
+  c.drawString(40, y, "AlphaDesk Equity Research Report")
+  y -= 26
+  c.setFont("Helvetica", 10)
+  c.drawString(40, y, f"Company: {company} ({symbol})")
+  y -= 14
+  c.drawString(40, y, f"Sector: {sector}")
+  y -= 14
+  c.drawString(40, y, f"Generated: {datetime.utcnow().strftime('%d-%b-%Y %H:%M UTC')}")
+  y -= 20
 
-  write_line("Summary", 12, 16)
-  write_line(f"Rating: {fa.get('rating') or 'HOLD'} | Confidence: {catalyst.get('confidence_score') or 'NA'}%")
-  write_line(f"CMP: {_inr(fundamentals.get('cmp'))} | Target: {_inr(fa.get('target_price'))} | Upside: {_pct(fa.get('upside_pct'))}")
+  section("Executive Summary")
+  write_wrapped(str(fa.get("rating_rationale") or "Research summary unavailable."), size=10, gap=13)
+  y -= 4
+  kv_row("Rating", str(fa.get("rating") or "HOLD"))
+  kv_row("Confidence", f"{_num(catalyst.get('confidence_score'), 0)}%")
+  kv_row("CMP", _inr(fundamentals.get("cmp")))
+  kv_row("Target", _inr(fa.get("target_price")))
+  kv_row("Upside", _pct(fa.get("upside_pct")))
 
-  write_line("Catalyst", 12, 16)
-  headline = str(catalyst.get("catalyst_headline") or "No primary catalyst identified")
-  for line in simpleSplit(headline, "Helvetica", 10, width - 80):
-    write_line(line)
+  section("Catalyst Deep Dive")
+  write_line(str(catalyst.get("catalyst_headline") or "No primary catalyst identified"), size=12, gap=16)
+  write_wrapped(str(catalyst.get("catalyst_detail") or "No catalyst narrative available."), size=10, gap=13)
+  evidence = catalyst.get("supporting_evidence") if isinstance(catalyst.get("supporting_evidence"), list) else []
+  if evidence:
+    write_line("Supporting Evidence", size=10, gap=13)
+    for item in evidence[:5]:
+      write_wrapped(f"- {item}", size=9, gap=11)
 
-  detail = str(catalyst.get("catalyst_detail") or "Catalyst narrative unavailable.")
-  for line in simpleSplit(detail, "Helvetica", 9, width - 80)[:25]:
-    write_line(line, 9, 12)
+  section("Fundamental Analysis")
+  kv_row("Business", str(fa.get("business_description") or "NA"))
+  kv_row("Balance Sheet", str(fa.get("balance_sheet_health") or "NA"))
+  kv_row("Valuation vs Peers", str(fa.get("valuation_vs_peers") or "NA"))
+  kv_row("Fundamental Score", str(fa.get("fundamental_score") or "NA"))
+  table(
+    ["Metric", "Value", "Metric", "Value"],
+    [
+      ["PE", _num(fundamentals.get("pe_ratio"), 2), "ROE", _pct(fundamentals.get("roe"))],
+      ["ROCE", _pct(fundamentals.get("roce")), "Debt/Equity", _num(fundamentals.get("debt_equity"), 2)],
+      ["Revenue Growth", _pct(fundamentals.get("revenue_growth_yoy")), "Promoter", _pct(fundamentals.get("promoter_holding"))],
+      ["FII", _pct(fundamentals.get("fii_holding")), "CMP", _inr(fundamentals.get("cmp"))],
+    ],
+  )
 
-  write_line("Fundamentals", 12, 16)
-  write_line(f"PE: {_num(fundamentals.get('pe_ratio'), 2)} | ROE: {_pct(fundamentals.get('roe'))} | D/E: {_num(fundamentals.get('debt_equity'), 2)}")
+  section("NSE / BSE Filings")
+  if ann_rows:
+    table(
+      ["Date", "Type", "Headline"],
+      [[str(r.get("date") or "NA"), str(r.get("type") or "NA"), str(r.get("headline") or "NA")] for r in ann_rows[:10]],
+    )
+  else:
+    write_line("No recent filing records available.", size=9, gap=12)
 
-  rationale = str(fa.get("rating_rationale") or "Rationale unavailable in fallback mode.")
-  for line in simpleSplit(rationale, "Helvetica", 9, width - 80)[:20]:
-    write_line(line, 9, 12)
+  section("Bulk / Block Deals")
+  if deals:
+    table(
+      ["Date", "Client", "Type", "Value (Cr)"],
+      [
+        [
+          str(d.get("date") or "NA"),
+          str(d.get("client_name") or "NA"),
+          str(d.get("deal_type") or "NA"),
+          _num(d.get("value_cr"), 2),
+        ]
+        for d in deals[:10]
+      ],
+    )
+  else:
+    write_line("No bulk/block deal records available.", size=9, gap=12)
+
+  section("Insider Trading")
+  if insider:
+    table(
+      ["Date", "Person", "Action", "Value (Lakh)"],
+      [
+        [
+          str(i.get("date") or "NA"),
+          str(i.get("person_name") or "NA"),
+          str(i.get("transaction_type") or "NA"),
+          _num(i.get("value_lakh"), 2),
+        ]
+        for i in insider[:10]
+      ],
+    )
+  else:
+    write_line("No insider transaction records available.", size=9, gap=12)
+
+  section("Sector and Risk Review")
+  kv_row("Sector Outlook", str(sr.get("sector_outlook") or "NEUTRAL"))
+  kv_row("Cycle Stage", str(sr.get("sector_cycle_stage") or "MID_UPCYCLE"))
+  tailwinds = sr.get("sector_tailwinds") if isinstance(sr.get("sector_tailwinds"), list) else []
+  if tailwinds:
+    write_line("Sector Tailwinds", size=10, gap=12)
+    for item in tailwinds[:4]:
+      write_wrapped(f"- {item}", size=9, gap=11)
+  if risks:
+    write_line("Top Risks", size=10, gap=12)
+    for r in risks[:4]:
+      title = str(r.get("risk_title") or "Risk")
+      sev = str(r.get("severity") or "LOW")
+      write_wrapped(f"- {title} ({sev}): {str(r.get('risk_detail') or 'NA')}", size=9, gap=11)
+
+  section("Peer Snapshot")
+  if peers:
+    table(
+      ["Peer", "Symbol", "PE", "ROE", "Rev Growth"],
+      [
+        [
+          str(p.get("name") or "NA"),
+          str(p.get("symbol") or "NA"),
+          _num(p.get("pe"), 2),
+          _pct(p.get("roe")),
+          _pct(p.get("revenue_growth")),
+        ]
+        for p in peers[:5]
+      ],
+    )
+  else:
+    write_line("Peer set unavailable.", size=9, gap=12)
+
+  section("Final Recommendation")
+  write_line(f"Final Rating: {str(fa.get('rating') or 'HOLD')}", size=12, gap=15)
+  write_wrapped(str(fa.get("rating_rationale") or "Recommendation rationale unavailable."), size=10, gap=13)
+  write_line("Disclaimer: For informational purposes only. Not investment advice.", size=8, gap=12)
 
   c.save()
   return buffer.getvalue()

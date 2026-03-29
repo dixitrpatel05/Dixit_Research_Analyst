@@ -25,6 +25,7 @@ from data_collectors import (
     nse_announcements,
     nse_bulk_block_deals,
     nse_insider_trading,
+    resolve_symbol_candidate,
     tavily_news_search,
     yfinance_fundamentals,
 )
@@ -437,6 +438,13 @@ async def run_research_pipeline(symbol: str) -> dict:
         return cached
 
     fundamentals = await yfinance_fundamentals(symbol)
+    if fundamentals.get("cmp") is None:
+        resolved = await resolve_symbol_candidate(symbol)
+        if resolved and resolved != symbol:
+            candidate = await yfinance_fundamentals(resolved)
+            if candidate.get("cmp") is not None:
+                symbol = resolved
+                fundamentals = candidate
     company_name = str(fundamentals.get("company_name") or symbol)
     sector = str(fundamentals.get("sector") or "Unknown")
     sub_sector = str((fundamentals.get("_raw_info") or {}).get("industry") or "Unknown")
@@ -521,7 +529,8 @@ async def run_research_pipeline(symbol: str) -> dict:
             "nse_insider": "ok" if insider_trades else "empty",
             "bse": "ok" if bse_items else "empty",
             "news": news_health,
-            "gemini": "ok" if ai_result.get("catalyst_analysis") else "partial",
+            "gemini": "ok" if (ai_result.get("ai_pipeline") or {}).get("source") != "heuristic" else "fallback",
+            "ai_pipeline": ai_result.get("ai_pipeline") or {"source": "heuristic", "model": "none", "fallback_used": True},
         },
     }
 

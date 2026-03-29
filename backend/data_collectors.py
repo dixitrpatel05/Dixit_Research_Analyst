@@ -377,8 +377,20 @@ async def nse_insider_trading(symbol: str) -> list[dict]:
     Fetch insider transaction announcements from NSE endpoint.
     """
     try:
-        endpoint = f"/api/corporate-announcements?symbol={symbol.upper()}&issuer=&subject=&fromDate=&toDate=&type=insider"
-        payload = await _nse_get_json(endpoint)
+        endpoint_candidates = [
+            f"/api/corporate-announcements?symbol={symbol.upper()}&issuer=&subject=&fromDate=&toDate=&type=insider",
+            f"/api/corp-announcements?index=equities&symbol={symbol.upper()}",
+        ]
+
+        payload = None
+        for endpoint in endpoint_candidates:
+            try:
+                payload = await _nse_get_json(endpoint)
+                if payload:
+                    break
+            except Exception:
+                continue
+
         rows = payload.get("data", payload) if isinstance(payload, dict) else payload
         if not isinstance(rows, list):
             return []
@@ -386,6 +398,10 @@ async def nse_insider_trading(symbol: str) -> list[dict]:
         output: list[dict] = []
         for item in rows:
             if not isinstance(item, dict):
+                continue
+            text = str(item.get("subject") or item.get("sm_name") or item.get("desc") or "").upper()
+            # In fallback endpoint mode, retain only insider-related announcements.
+            if "INSIDER" not in text and "PIT" not in text and "SAST" not in text:
                 continue
             raw_date = item.get("date") or item.get("broadcastDt") or item.get("an_dt")
             dt = _parse_date(str(raw_date) if raw_date is not None else None)
@@ -622,3 +638,30 @@ async def get_peer_data(symbol: str, sector: str | None) -> list[dict]:
         return results
     except Exception:
         return []
+
+
+async def resolve_symbol_candidate(symbol: str) -> str:
+    """
+    Try resolving OCR/manual ticker variants to a valid NSE symbol via Yahoo search.
+    Returns the original symbol when no confident match is found.
+    """
+    base = (symbol or "").strip().upper()
+    if not base:
+        return symbol
+
+    try:
+        search = await asyncio.to_thread(yf.Search, base, max_results=8)
+        quotes = getattr(search, "quotes", []) or []
+        for item in quotes:
+            if not isinstance(item, dict):
+                continue
+            raw = str(item.get("symbol") or "").upper().strip()
+            if not raw.endswith(".NS"):
+                continue
+            nse = raw[:-3]
+            if re.fullmatch(r"[A-Z][A-Z0-9]{1,9}", nse):
+                return nse
+    except Exception:
+        pass
+
+    return base
