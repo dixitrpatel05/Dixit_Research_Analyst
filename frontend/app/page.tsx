@@ -68,7 +68,14 @@ export default function Home() {
           const maybeJson = (await response.json()) as { error?: string; detail?: string };
           detail = maybeJson.error || maybeJson.detail || "";
         } catch {
-          // Keep fallback message when response is not JSON.
+          try {
+            const text = (await response.text()).trim();
+            if (text) {
+              detail = text.slice(0, 240);
+            }
+          } catch {
+            // Keep fallback message when response body is unavailable.
+          }
         }
         throw new Error(`OCR request failed: ${response.status}${detail ? ` (${detail})` : ""}`);
       }

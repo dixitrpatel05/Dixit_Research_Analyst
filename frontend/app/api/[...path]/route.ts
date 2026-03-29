@@ -5,7 +5,7 @@ function normalizeBaseUrl(value: string | undefined): string {
     return "";
   }
 
-  const raw = value.trim().replace(/\/$/, "");
+  const raw = value.trim().replace(/^['\"]|['\"]$/g, "").replace(/\/$/, "");
   if (/^https?:\/\//i.test(raw)) {
     return raw;
   }
@@ -17,35 +17,47 @@ function normalizeBaseUrl(value: string | undefined): string {
   return `https://${raw}`;
 }
 
-function getBackendBaseUrl(): string {
-  return normalizeBaseUrl(
-    process.env.BACKEND_API_URL ||
-      process.env.RAILWAY_BACKEND_URL ||
-      process.env.NEXT_PUBLIC_API_URL ||
-      "",
-  );
+function getBackendBaseUrls(): string[] {
+  const rawValues = [
+    process.env.BACKEND_API_URL,
+    process.env.RAILWAY_BACKEND_URL,
+    process.env.NEXT_PUBLIC_API_URL,
+  ];
+
+  const out: string[] = [];
+  for (const value of rawValues) {
+    if (!value) continue;
+    const parts = value.split(/[\s,;]+/).filter(Boolean);
+    for (const part of parts) {
+      const normalized = normalizeBaseUrl(part);
+      if (normalized && !out.includes(normalized)) {
+        out.push(normalized);
+      }
+    }
+  }
+  return out;
 }
 
-function buildError(message: string, status = 500): Response {
-  return Response.json({ error: message }, { status });
+function buildError(
+  message: string,
+  status = 500,
+  extraHeaders?: Record<string, string>,
+): Response {
+  const headers = new Headers(extraHeaders || {});
+  return Response.json({ error: message }, { status, headers });
 }
 
 async function proxy(request: NextRequest, pathSegments: string[]): Promise<Response> {
-  const baseUrl = getBackendBaseUrl();
-  if (!baseUrl) {
-    return buildError("Backend API URL is not configured on frontend service.", 500);
+  const candidates = getBackendBaseUrls();
+  if (!candidates.length) {
+    return buildError("Backend API URL is not configured on frontend service.", 500, {
+      "x-proxy-error": "missing-backend-url",
+    });
   }
 
   const incoming = new URL(request.url);
-  const upstream = new URL(baseUrl);
-
-  // Guard against accidental self-proxy loops from misconfigured backend URL.
-  if (incoming.host === upstream.host) {
-    return buildError("Backend API URL points to frontend host. Set backend service URL explicitly.", 500);
-  }
 
   const path = pathSegments.join("/");
-  const upstreamUrl = `${baseUrl}/api/${path}${incoming.search}`;
 
   const headers = new Headers(request.headers);
   headers.delete("host");
@@ -63,23 +75,54 @@ async function proxy(request: NextRequest, pathSegments: string[]): Promise<Resp
     (init as RequestInit & { duplex?: "half" }).duplex = "half";
   }
 
-  let upstreamResponse: Response;
-  try {
-    upstreamResponse = await fetch(upstreamUrl, init);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : "Upstream request failed";
-    return buildError(`Unable to reach backend API: ${detail}`, 502);
+  const tried: string[] = [];
+  let lastNetworkError = "";
+
+  for (const baseUrl of candidates) {
+    let upstream: URL;
+    try {
+      upstream = new URL(baseUrl);
+    } catch {
+      continue;
+    }
+
+    // Guard against accidental self-proxy loops from misconfigured backend URL.
+    if (incoming.host === upstream.host) {
+      continue;
+    }
+
+    const upstreamUrl = `${baseUrl}/api/${path}${incoming.search}`;
+    tried.push(upstream.host);
+
+    try {
+      const upstreamResponse = await fetch(upstreamUrl, init);
+
+      const responseHeaders = new Headers(upstreamResponse.headers);
+      responseHeaders.delete("content-encoding");
+      responseHeaders.delete("transfer-encoding");
+      responseHeaders.delete("connection");
+      responseHeaders.set("x-proxy-target", upstream.host);
+
+      return new Response(upstreamResponse.body, {
+        status: upstreamResponse.status,
+        statusText: upstreamResponse.statusText,
+        headers: responseHeaders,
+      });
+    } catch (error) {
+      lastNetworkError = error instanceof Error ? error.message : "Upstream request failed";
+      continue;
+    }
   }
 
-  const responseHeaders = new Headers(upstreamResponse.headers);
-  responseHeaders.delete("content-encoding");
-  responseHeaders.delete("transfer-encoding");
-  responseHeaders.delete("connection");
+  if (!tried.length) {
+    return buildError("Backend API URL points to frontend host. Set backend service URL explicitly.", 500, {
+      "x-proxy-error": "self-proxy-blocked",
+    });
+  }
 
-  return new Response(upstreamResponse.body, {
-    status: upstreamResponse.status,
-    statusText: upstreamResponse.statusText,
-    headers: responseHeaders,
+  return buildError(`Unable to reach backend API: ${lastNetworkError || "network error"}`, 502, {
+    "x-proxy-error": "upstream-unreachable",
+    "x-proxy-tried": tried.join(","),
   });
 }
 

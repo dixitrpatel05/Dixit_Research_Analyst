@@ -12,6 +12,10 @@ Required (explicit):
   - `RAILWAY_BACKEND_URL=https://your-backend.example.com`
 - Optional: `NEXT_PUBLIC_API_URL` with the same value.
 
+Critical placement:
+- Set this variable on the frontend service itself.
+- Setting it only on backend service does not make frontend `/api/*` proxy work.
+
 Important:
 - `/api/*` is now handled by a runtime Next route proxy, not rewrites.
 - If backend URL is missing or points to frontend host, proxy returns a clear JSON error instead of opaque 502 failures.
