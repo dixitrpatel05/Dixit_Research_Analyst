@@ -73,11 +73,11 @@ Both commands pass.
 
 ## Zero-Edit Deployment Env Setup (Vercel + Railway)
 
-- Frontend (`frontend/next.config.js`) resolves backend URL in this order:
+- Frontend runtime API proxy (`frontend/app/api/[...path]/route.ts`) resolves backend URL in this order:
 	1. `BACKEND_API_URL`
-	2. `NEXT_PUBLIC_API_URL`
-	3. `RAILWAY_BACKEND_URL`
-- `RAILWAY_PUBLIC_DOMAIN` and `RAILWAY_STATIC_URL` are intentionally not used as backend fallbacks, to avoid self-proxy loops when frontend and backend are separate services.
+	2. `RAILWAY_BACKEND_URL`
+	3. `NEXT_PUBLIC_API_URL`
+- If backend URL is missing or points to the frontend host, proxy returns explicit config error JSON instead of opaque 502.
 - Backend auto-detects provider keys with aliases:
 	- Gemini: `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`
 	- Tavily: `TAVILY_API_KEY`, `TAVILY_KEY`
