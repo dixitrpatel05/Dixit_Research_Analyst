@@ -2,15 +2,34 @@ import asyncio
 import json
 from typing import Any
 
-import google.generativeai as genai
+try:
+    from google import genai as genai_new
+except Exception:
+    genai_new = None
+
+try:
+    import google.generativeai as genai_legacy
+except Exception:
+    genai_legacy = None
 
 from env import get_backend_key
 
 _gemini_api_key = get_backend_key("gemini")
-model = None
-if _gemini_api_key:
-    genai.configure(api_key=_gemini_api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+
+client_new = None
+model_legacy = None
+if _gemini_api_key and genai_new is not None:
+    try:
+        client_new = genai_new.Client(api_key=_gemini_api_key)
+    except Exception:
+        client_new = None
+
+if _gemini_api_key and genai_legacy is not None:
+    try:
+        genai_legacy.configure(api_key=_gemini_api_key)
+        model_legacy = genai_legacy.GenerativeModel("gemini-1.5-flash")
+    except Exception:
+        model_legacy = None
 
 
 def _safe_json_load(text: str) -> dict:
@@ -38,19 +57,36 @@ def _safe_json_load(text: str) -> dict:
 
 def call_gemini(prompt: str) -> dict:
     """Call Gemini and parse JSON response with retry logic."""
-    if model is None:
+    if client_new is None and model_legacy is None:
         return {}
 
     for attempt in range(3):
         try:
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                ),
-            )
-            return _safe_json_load(getattr(response, "text", "") or "")
+            if client_new is not None:
+                response = client_new.models.generate_content(
+                    model="gemini-1.5-flash",
+                    contents=prompt,
+                    config={
+                        "temperature": 0.1,
+                        "response_mime_type": "application/json",
+                    },
+                )
+                text = getattr(response, "text", "") or ""
+                parsed = _safe_json_load(text)
+                if parsed:
+                    return parsed
+
+            if model_legacy is not None:
+                response = model_legacy.generate_content(
+                    prompt,
+                    generation_config=genai_legacy.types.GenerationConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                )
+                parsed = _safe_json_load(getattr(response, "text", "") or "")
+                if parsed:
+                    return parsed
         except Exception:
             if attempt == 2:
                 return {}
@@ -128,17 +164,17 @@ def _heuristic_catalyst_fallback(
     quality = "HIGH" if non_empty >= 3 else "MEDIUM" if non_empty >= 2 else "LOW"
 
     detail = (
-        f"AI catalyst model was unavailable, so fallback heuristics were used for {company_name} ({symbol}). "
+        f"Heuristic catalyst scoring was used for {company_name} ({symbol}) due to limited model output. "
         f"The assessment blends trend data (price vs 200DMA: {vs_200dma if vs_200dma is not None else 'NA'}%), "
         f"fundamental momentum (revenue growth: {rev_growth if rev_growth is not None else 'NA'}%), and event flow across "
         f"announcements, news, and deal activity. Sector context for {sector or 'the sector'} remains a secondary support, "
-        "while confidence is calibrated lower than full-model output to reflect reduced narrative certainty."
+        "while confidence is calibrated conservatively to reflect data certainty."
     )
 
     evidence = evidence[:3] or [
-        "Fallback heuristic mode active due to unavailable AI response",
+        "Fallback heuristic mode active due to limited model response",
         "Market and disclosure data were used as confidence anchors",
-        "Re-run may produce richer catalyst narrative when model is available",
+        "Re-run may produce richer catalyst narrative with additional inputs",
     ]
 
     return {

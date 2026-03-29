@@ -235,25 +235,51 @@ def _extract_symbols_with_gemini_vision(image: Image.Image) -> list[str]:
     if not api_key:
         return []
 
+    prompts = [
+        (
+            "You are reading a TradingView watchlist screenshot with columns like Symbol and Last. "
+            "Extract ticker symbols from the Symbol column only. "
+            "Return strict JSON: {\"symbols\": [\"RELIANCE\", \"INFY\"]}. "
+            "Rules: uppercase, max 10 chars, no prices, no bullets, no extra keys."
+        ),
+        (
+            "List only ticker symbols visible in this watchlist image. "
+            "One symbol per line, uppercase, no explanation, no numbering."
+        ),
+    ]
+
+    best: list[str] = []
+
+    # Prefer modern Gemini SDK when available.
+    try:
+        from google import genai as genai_new
+
+        client = genai_new.Client(api_key=api_key)
+        for variant in _prepare_image_variants(image)[:3]:
+            for idx, prompt in enumerate(prompts):
+                response = client.models.generate_content(
+                    model="gemini-1.5-flash",
+                    contents=[prompt, variant],
+                    config={
+                        "temperature": 0,
+                        "response_mime_type": "application/json" if idx == 0 else "text/plain",
+                    },
+                )
+                raw = (getattr(response, "text", "") or "").strip()
+                symbols = _extract_symbols_from_model_text(raw)
+                if len(symbols) > len(best):
+                    best = symbols
+                if len(best) >= 5:
+                    return best
+    except Exception:
+        pass
+
+    # Legacy SDK fallback.
     try:
         import google.generativeai as genai
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-1.5-flash")
-        prompts = [
-            (
-                "You are reading a TradingView watchlist screenshot with columns like Symbol and Last. "
-                "Extract ticker symbols from the Symbol column only. "
-                "Return strict JSON: {\"symbols\": [\"RELIANCE\", \"INFY\"]}. "
-                "Rules: uppercase, max 10 chars, no prices, no bullets, no extra keys."
-            ),
-            (
-                "List only ticker symbols visible in this watchlist image. "
-                "One symbol per line, uppercase, no explanation, no numbering."
-            ),
-        ]
-
-        best: list[str] = []
         for variant in _prepare_image_variants(image)[:3]:
             for idx, prompt in enumerate(prompts):
                 response = model.generate_content(
@@ -269,9 +295,10 @@ def _extract_symbols_with_gemini_vision(image: Image.Image) -> list[str]:
                     best = symbols
                 if len(best) >= 5:
                     return best
-        return best
     except Exception:
-        return []
+        pass
+
+    return best
 
 
 def _extract_symbols_from_image_bytes(content: bytes) -> list[str]:

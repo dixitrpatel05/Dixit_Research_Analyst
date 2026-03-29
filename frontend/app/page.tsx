@@ -5,6 +5,7 @@ import { UploadCloud } from "lucide-react";
 import { useRouter } from "next/navigation";
 
 import { apiFetch } from "../src/lib/apiClient";
+import { extractSymbolsFromImageClient } from "../src/lib/localOcr";
 import { useAlphaStore } from "../src/store/useAlphaStore";
 
 type OcrResponse = {
@@ -81,10 +82,18 @@ export default function Home() {
       }
 
       const data = (await response.json()) as OcrResponse;
-      const extracted = Array.isArray(data.symbols) ? data.symbols : [];
+      let extracted = Array.isArray(data.symbols) ? data.symbols : [];
+
+      if (!extracted.length && hasFile && selectedFile) {
+        try {
+          extracted = await extractSymbolsFromImageClient(selectedFile);
+        } catch {
+          // Keep default message below if client OCR also fails.
+        }
+      }
 
       if (!extracted.length) {
-        setErrorMessage("No valid symbols detected. Try clearer image or type symbols manually.");
+        setErrorMessage("No valid symbols detected. Try a tighter watchlist crop or type symbols manually.");
         return;
       }
 

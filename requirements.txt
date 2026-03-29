@@ -6,6 +6,7 @@ httpx
 pytesseract
 Pillow
 google-generativeai
+google-genai
 yfinance
 nsetools
 beautifulsoup4
