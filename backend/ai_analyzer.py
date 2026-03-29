@@ -33,6 +33,15 @@ if _gemini_api_key and genai_legacy is not None:
         model_legacy = None
 
 
+def ai_client_status() -> dict:
+    return {
+        "api_key_present": bool(_gemini_api_key),
+        "google_genai_ready": client_new is not None,
+        "google_generativeai_ready": model_legacy is not None,
+        "model_candidates": MODEL_CANDIDATES,
+    }
+
+
 def _safe_json_load(text: str) -> dict:
     if not text:
         return {}
@@ -71,41 +80,51 @@ def call_gemini(prompt: str) -> dict:
         try:
             if client_new is not None:
                 for model_name in MODEL_CANDIDATES:
-                    response = client_new.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config={
-                            "temperature": 0.1,
-                            "response_mime_type": "application/json",
-                        },
-                    )
-                    text = getattr(response, "text", "") or ""
-                    parsed = _safe_json_load(text)
-                    if parsed:
-                        return _wrap(parsed, "google.genai", model_name)
+                    for cfg in (
+                        {"temperature": 0.1, "response_mime_type": "application/json"},
+                        {"temperature": 0.1},
+                    ):
+                        response = client_new.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                            config=cfg,
+                        )
+                        text = getattr(response, "text", "") or ""
+                        parsed = _safe_json_load(text)
+                        if parsed:
+                            return _wrap(parsed, "google.genai", model_name)
 
             if model_legacy is not None:
                 for model_name in MODEL_CANDIDATES:
                     legacy_model = genai_legacy.GenerativeModel(model_name)
-                    response = legacy_model.generate_content(
-                        prompt,
-                        generation_config=genai_legacy.types.GenerationConfig(
+                    for generation_config in (
+                        genai_legacy.types.GenerationConfig(
                             temperature=0.1,
                             response_mime_type="application/json",
                         ),
-                    )
-                    parsed = _safe_json_load(getattr(response, "text", "") or "")
-                    if parsed:
-                        return _wrap(parsed, "google.generativeai", model_name)
+                        genai_legacy.types.GenerationConfig(
+                            temperature=0.1,
+                        ),
+                    ):
+                        response = legacy_model.generate_content(
+                            prompt,
+                            generation_config=generation_config,
+                        )
+                        parsed = _safe_json_load(getattr(response, "text", "") or "")
+                        if parsed:
+                            return _wrap(parsed, "google.generativeai", model_name)
         except Exception:
             if attempt == 2:
                 return {}
     return {}
 
 
-def _compact_json(payload: Any) -> str:
+def _compact_json(payload: Any, max_chars: int = 3500) -> str:
     try:
-        return json.dumps(payload, indent=2, default=str)
+        text = json.dumps(payload, separators=(",", ":"), default=str)
+        if len(text) > max_chars:
+            return text[:max_chars] + "..."
+        return text
     except Exception:
         return "{}"
 
@@ -129,8 +148,8 @@ def _heuristic_catalyst_fallback(
     insider_trades: list[dict],
     news_articles: list[dict],
 ) -> dict:
-    catalyst_type = "SECTOR_TAILWIND"
-    headline = "Momentum supported by sector and liquidity"
+    catalyst_type = "OTHER"
+    headline = "No confirmed single catalyst yet"
     evidence: list[str] = []
 
     if bulk_deals:
@@ -155,7 +174,7 @@ def _heuristic_catalyst_fallback(
     roe = _safe_num(fundamentals.get("roe"))
     debt_equity = _safe_num(fundamentals.get("debt_equity"))
 
-    confidence = 42
+    confidence = 40
     if vs_200dma is not None:
         confidence += 8 if vs_200dma > 5 else 3 if vs_200dma > 0 else -2
     if rev_growth is not None:
@@ -168,6 +187,17 @@ def _heuristic_catalyst_fallback(
     confidence += min(8, len(announcements)) // 2
     confidence += min(6, len(bulk_deals))
     confidence = max(35, min(82, int(confidence)))
+
+    if catalyst_type == "OTHER":
+        if vs_200dma is not None and vs_200dma > 12:
+            catalyst_type = "MULTIPLE"
+            headline = "Momentum breakout with improving market participation"
+        elif rev_growth is not None and rev_growth > 12:
+            catalyst_type = "RESULTS_BEAT"
+            headline = "Earnings momentum likely supporting rerating"
+        elif debt_equity is not None and debt_equity < 0.6 and roe is not None and roe > 15:
+            catalyst_type = "MANAGEMENT_UPGRADE"
+            headline = "Quality balance-sheet profile attracting revaluation"
 
     data_points = [announcements, bulk_deals, insider_trades, news_articles]
     non_empty = sum(1 for p in data_points if p)
@@ -266,6 +296,11 @@ def _catalyst_prompt(
     insider_trades: list[dict],
     news_articles: list[dict],
 ) -> str:
+    announcements_slim = announcements[:12]
+    bulk_slim = bulk_deals[:12]
+    insider_slim = insider_trades[:12]
+    news_slim = news_articles[:12]
+
     return f"""You are a senior equity research analyst at a top Indian institutional brokerage. I will give you raw data about a stock. Your task is to identify the PRIMARY catalyst driving the recent price upmove.
 
 STOCK: {symbol} — {company_name}
@@ -273,16 +308,16 @@ SECTOR: {sector}
 PRICE PERFORMANCE: CMP ₹{cmp_value}, 52W High ₹{high_52w}, 52W Low ₹{low_52w}, vs 200DMA: {vs_200dma}%
 
 NSE ANNOUNCEMENTS (last 90 days):
-{_compact_json(announcements)}
+{_compact_json(announcements_slim)}
 
 BULK/BLOCK DEALS (last 30 days):
-{_compact_json(bulk_deals)}
+{_compact_json(bulk_slim)}
 
 INSIDER TRADING:
-{_compact_json(insider_trades)}
+{_compact_json(insider_slim)}
 
 RECENT NEWS:
-{_compact_json(news_articles[:10])}
+{_compact_json(news_slim)}
 
 Based on all this data, return a JSON object with EXACTLY these fields:
 {{
@@ -300,13 +335,14 @@ Return ONLY valid JSON, no markdown."""
 
 
 def _fundamental_prompt(company_name: str, symbol: str, fundamentals: dict, peers: list[dict]) -> str:
+    peers_slim = peers[:8]
     return f"""You are a fundamental equity analyst. Based on the financial data below for {company_name} NSE:{symbol}, provide analysis and scoring.
 
 FINANCIAL DATA:
 {_compact_json(fundamentals)}
 
 PEER DATA:
-{_compact_json(peers)}
+{_compact_json(peers_slim)}
 
 Return JSON with:
 {{
@@ -336,12 +372,13 @@ def _sector_risk_prompt(
     sub_sector: str,
     sector_news: list[dict],
 ) -> str:
+    news_slim = sector_news[:10]
     return f"""You are a macro research analyst covering Indian equity markets.
 
 COMPANY: {company_name}, SECTOR: {sector}, SUB-SECTOR: {sub_sector}
 
 RECENT SECTOR NEWS:
-{_compact_json(sector_news)}
+{_compact_json(news_slim)}
 
 Provide analysis JSON:
 {{

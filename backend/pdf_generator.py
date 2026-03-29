@@ -12,10 +12,18 @@ except Exception:
 
 try:
   from reportlab.lib.pagesizes import A4
+  from reportlab.lib import colors
+  from reportlab.graphics import renderPDF
+  from reportlab.graphics.charts.barcharts import VerticalBarChart
+  from reportlab.graphics.shapes import Drawing
   from reportlab.lib.utils import simpleSplit
   from reportlab.pdfgen import canvas
 except Exception:
   A4 = None
+  colors = None
+  renderPDF = None
+  VerticalBarChart = None
+  Drawing = None
   canvas = None
   simpleSplit = None
 
@@ -614,6 +622,43 @@ def generate_pdf_bytes(report: dict) -> bytes:
       ["FII", _pct(fundamentals.get("fii_holding")), "CMP", _inr(fundamentals.get("cmp"))],
     ],
   )
+
+  if Drawing is not None and VerticalBarChart is not None and renderPDF is not None:
+    ensure_space(220)
+    write_line("Financial Visual Snapshot", size=10, gap=12)
+    cmp_value = fundamentals.get("cmp")
+    rev_growth = fundamentals.get("revenue_growth_yoy")
+    roe_value = fundamentals.get("roe")
+    try:
+      values = [
+        float(rev_growth) if rev_growth is not None else 0.0,
+        float(roe_value) if roe_value is not None else 0.0,
+        float(fa.get("upside_pct")) if fa.get("upside_pct") is not None else 0.0,
+      ]
+    except Exception:
+      values = [0.0, 0.0, 0.0]
+
+    drawing = Drawing(360, 170)
+    chart = VerticalBarChart()
+    chart.x = 40
+    chart.y = 25
+    chart.height = 110
+    chart.width = 280
+    chart.data = [values]
+    chart.strokeColor = colors.transparent
+    chart.valueAxis.valueMin = min(-20, min(values) - 5)
+    chart.valueAxis.valueMax = max(30, max(values) + 5)
+    chart.valueAxis.valueStep = 10
+    chart.categoryAxis.categoryNames = ["Rev%", "ROE%", "Upside%"]
+    chart.categoryAxis.labels.fillColor = colors.HexColor("#374151")
+    chart.valueAxis.labels.fillColor = colors.HexColor("#6B7280")
+    chart.bars[0].fillColor = colors.HexColor("#2563EB")
+    chart.bars[0].strokeColor = colors.HexColor("#1D4ED8")
+    drawing.add(chart)
+
+    renderPDF.draw(drawing, c, 40, y - 145)
+    y -= 156
+    write_line(f"CMP Reference: {_inr(cmp_value)}", size=8, gap=12)
 
   section("NSE / BSE Filings")
   if ann_rows:

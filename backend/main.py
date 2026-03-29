@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from env import get_backend_key, has_backend_key
 
-from ai_analyzer import analyze_stock_with_gemini
+from ai_analyzer import ai_client_status, analyze_stock_with_gemini
 from data_collectors import (
     bse_announcements,
     get_peer_data,
@@ -650,6 +650,7 @@ async def health() -> JSONResponse:
             "status": "ok",
             "time": _now_utc().isoformat(),
             "cache_entries": len(RESEARCH_CACHE),
+            "ai": ai_client_status(),
             "data_sources": {
                 "yfinance": "operational",
                 "nse": "operational",
