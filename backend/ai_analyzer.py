@@ -24,6 +24,16 @@ _gemini_api_key = get_backend_key("gemini")
 _groq_api_key = get_backend_key("groq")
 MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-1.5-flash"]
 GROQ_MODEL = "llama-3.3-70b-versatile"
+DAILY_TOKEN_BUDGET_EST = 28000
+LITE_MODE_TOKEN_THRESHOLD = 24000
+
+_AI_BUDGET_STATE: dict[str, Any] = {
+    "day": "",
+    "reserved_tokens": 0,
+    "calls": 0,
+}
+
+_SECTOR_MEMO_CACHE: dict[str, dict[str, Any]] = {}
 
 client_new = None
 model_legacy = None
@@ -50,6 +60,7 @@ if _gemini_api_key and genai_legacy is not None:
 
 
 def ai_client_status() -> dict:
+    _reset_budget_if_needed()
     return {
         "api_key_present": bool(_gemini_api_key),
         "groq_api_key_present": bool(_groq_api_key),
@@ -58,7 +69,48 @@ def ai_client_status() -> dict:
         "google_generativeai_ready": model_legacy is not None,
         "model_candidates": MODEL_CANDIDATES,
         "groq_model": GROQ_MODEL if groq_client is not None else None,
+        "budget": {
+            "daily_est_limit": DAILY_TOKEN_BUDGET_EST,
+            "reserved_tokens": int(_AI_BUDGET_STATE.get("reserved_tokens") or 0),
+            "remaining_est": max(0, DAILY_TOKEN_BUDGET_EST - int(_AI_BUDGET_STATE.get("reserved_tokens") or 0)),
+            "calls": int(_AI_BUDGET_STATE.get("calls") or 0),
+            "mode": "lite" if int(_AI_BUDGET_STATE.get("reserved_tokens") or 0) >= LITE_MODE_TOKEN_THRESHOLD else "standard",
+        },
     }
+
+
+def _today_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _reset_budget_if_needed() -> None:
+    day = _today_key()
+    if _AI_BUDGET_STATE.get("day") != day:
+        _AI_BUDGET_STATE["day"] = day
+        _AI_BUDGET_STATE["reserved_tokens"] = 0
+        _AI_BUDGET_STATE["calls"] = 0
+
+
+def _estimate_tokens(text: str) -> int:
+    # Cheap approximation to avoid extra tokenizer dependency.
+    return max(1, len(text or "") // 4)
+
+
+def _reserve_budget(prompt: str, max_output_tokens: int) -> bool:
+    _reset_budget_if_needed()
+    est = _estimate_tokens(prompt) + max(64, int(max_output_tokens))
+    used = int(_AI_BUDGET_STATE.get("reserved_tokens") or 0)
+    if used + est > DAILY_TOKEN_BUDGET_EST:
+        return False
+    _AI_BUDGET_STATE["reserved_tokens"] = used + est
+    _AI_BUDGET_STATE["calls"] = int(_AI_BUDGET_STATE.get("calls") or 0) + 1
+    return True
+
+
+def _current_mode() -> str:
+    _reset_budget_if_needed()
+    used = int(_AI_BUDGET_STATE.get("reserved_tokens") or 0)
+    return "lite" if used >= LITE_MODE_TOKEN_THRESHOLD else "standard"
 
 
 def _safe_json_load(text: str) -> dict:
@@ -84,9 +136,12 @@ def _safe_json_load(text: str) -> dict:
     return {}
 
 
-def call_gemini(prompt: str) -> dict:
-    """Call Groq (primary) then Gemini (fallback) with retry logic and JSON parsing."""
+def call_gemini(prompt: str, max_output_tokens: int = 1400, mode: str = "standard") -> dict:
+    """Call Groq (primary) then Gemini (fallback) with budget-aware, low-retry JSON parsing."""
     if groq_client is None and client_new is None and model_legacy is None:
+        return {}
+
+    if not _reserve_budget(prompt, max_output_tokens):
         return {}
 
     def _wrap(payload: dict, source: str, model_name: str) -> dict:
@@ -94,6 +149,8 @@ def call_gemini(prompt: str) -> dict:
         out["_ai_source"] = source
         out["_ai_model"] = model_name
         return out
+
+    lite = mode == "lite"
 
     # Try Groq first (faster, generous free tier)
     if groq_client is not None:
@@ -107,57 +164,54 @@ def call_gemini(prompt: str) -> dict:
                     }
                 ],
                 temperature=0.1,
-                max_tokens=2048,
+                max_tokens=900 if lite else max_output_tokens,
             )
             text = response.choices[0].message.content or ""
             parsed = _safe_json_load(text)
             if parsed:
                 return _wrap(parsed, "groq", GROQ_MODEL)
-        except Exception as e:
-            # Log and continue to Gemini fallback
+        except Exception:
             pass
 
-    # Fallback to Gemini with multi-model retry
-    for attempt in range(3):
-        try:
-            if client_new is not None:
-                for model_name in MODEL_CANDIDATES:
-                    for cfg in (
-                        {"temperature": 0.1, "response_mime_type": "application/json"},
-                        {"temperature": 0.1},
-                    ):
-                        response = client_new.models.generate_content(
-                            model=model_name,
-                            contents=prompt,
-                            config=cfg,
-                        )
-                        text = getattr(response, "text", "") or ""
-                        parsed = _safe_json_load(text)
-                        if parsed:
-                            return _wrap(parsed, "google.genai", model_name)
+    # Fallback to Gemini with one-pass attempts to control token burn.
+    try:
+        if client_new is not None:
+            for model_name in MODEL_CANDIDATES:
+                for cfg in (
+                    {"temperature": 0.1, "response_mime_type": "application/json"},
+                    {"temperature": 0.1},
+                ):
+                    response = client_new.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=cfg,
+                    )
+                    text = getattr(response, "text", "") or ""
+                    parsed = _safe_json_load(text)
+                    if parsed:
+                        return _wrap(parsed, "google.genai", model_name)
 
-            if model_legacy is not None:
-                for model_name in MODEL_CANDIDATES:
-                    legacy_model = genai_legacy.GenerativeModel(model_name)
-                    for generation_config in (
-                        genai_legacy.types.GenerationConfig(
-                            temperature=0.1,
-                            response_mime_type="application/json",
-                        ),
-                        genai_legacy.types.GenerationConfig(
-                            temperature=0.1,
-                        ),
-                    ):
-                        response = legacy_model.generate_content(
-                            prompt,
-                            generation_config=generation_config,
-                        )
-                        parsed = _safe_json_load(getattr(response, "text", "") or "")
-                        if parsed:
-                            return _wrap(parsed, "google.generativeai", model_name)
-        except Exception:
-            if attempt == 2:
-                return {}
+        if model_legacy is not None and not lite:
+            for model_name in MODEL_CANDIDATES:
+                legacy_model = genai_legacy.GenerativeModel(model_name)
+                for generation_config in (
+                    genai_legacy.types.GenerationConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                    genai_legacy.types.GenerationConfig(
+                        temperature=0.1,
+                    ),
+                ):
+                    response = legacy_model.generate_content(
+                        prompt,
+                        generation_config=generation_config,
+                    )
+                    parsed = _safe_json_load(getattr(response, "text", "") or "")
+                    if parsed:
+                        return _wrap(parsed, "google.generativeai", model_name)
+    except Exception:
+        return {}
     return {}
 
 
@@ -484,6 +538,229 @@ Provide analysis JSON:
 Return ONLY valid JSON."""
 
 
+def _recent_sorted(items: list[dict], date_keys: tuple[str, ...], limit: int) -> list[dict]:
+    def _get_dt(entry: dict) -> datetime:
+        for key in date_keys:
+            dt = _parse_any_date(entry.get(key))
+            if dt is not None:
+                return dt
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    out = [x for x in items if isinstance(x, dict)]
+    out.sort(key=_get_dt, reverse=True)
+    return out[:limit]
+
+
+def _compact_inputs_for_model(
+    announcements: list[dict],
+    bulk_deals: list[dict],
+    insider_trades: list[dict],
+    news_articles: list[dict],
+    peers: list[dict],
+    sector_news: list[dict],
+    mode: str,
+) -> dict[str, list[dict]]:
+    is_lite = mode == "lite"
+
+    ann_limit = 5 if is_lite else 8
+    deal_limit = 4 if is_lite else 6
+    insider_limit = 4 if is_lite else 6
+    news_limit = 6 if is_lite else 10
+    peer_limit = 4 if is_lite else 6
+
+    ann = _recent_sorted(announcements, ("date",), ann_limit)
+    deals = _recent_sorted(bulk_deals, ("date",), deal_limit)
+    insider = _recent_sorted(insider_trades, ("date",), insider_limit)
+    news = _recent_sorted(news_articles, ("published_date", "date"), news_limit)
+    sec_news = _recent_sorted(sector_news, ("published_date", "date"), news_limit)
+    peers_slim = _recent_sorted(peers, ("date",), peer_limit)
+
+    # Keep only high-signal fields to reduce token burn.
+    ann = [{"date": a.get("date"), "type": a.get("type"), "headline": a.get("headline")} for a in ann]
+    deals = [
+        {
+            "date": d.get("date"),
+            "deal_type": d.get("deal_type"),
+            "client": d.get("client_name"),
+            "value_cr": d.get("value_cr"),
+        }
+        for d in deals
+    ]
+    insider = [
+        {
+            "date": i.get("date"),
+            "person": i.get("person_name"),
+            "type": i.get("transaction_type"),
+            "value_lakh": i.get("value_lakh"),
+        }
+        for i in insider
+    ]
+    news = [
+        {
+            "date": n.get("published_date") or n.get("date"),
+            "title": n.get("title"),
+            "source": n.get("source"),
+        }
+        for n in news
+    ]
+    sec_news = [
+        {
+            "date": n.get("published_date") or n.get("date"),
+            "title": n.get("title"),
+            "source": n.get("source"),
+        }
+        for n in sec_news
+    ]
+    peers_slim = [
+        {
+            "name": p.get("name"),
+            "symbol": p.get("symbol"),
+            "pe": p.get("pe"),
+            "roe": p.get("roe"),
+            "revenue_growth": p.get("revenue_growth"),
+        }
+        for p in peers_slim
+    ]
+
+    return {
+        "announcements": ann,
+        "bulk_deals": deals,
+        "insider_trades": insider,
+        "news_articles": news,
+        "sector_news": sec_news,
+        "peers": peers_slim,
+    }
+
+
+def _unified_analysis_prompt(
+    symbol: str,
+    company_name: str,
+    sector: str,
+    sub_sector: str,
+    fundamentals: dict,
+    compact_inputs: dict[str, list[dict]],
+    mode: str,
+) -> str:
+    max_words = "100" if mode == "lite" else "180"
+    return f"""You are a senior Indian equities research analyst. Produce ONE strict JSON covering catalyst, fundamentals, and sector risk.
+
+STRICT RULES:
+1) Use only evidence from last 90 days for catalyst and sector-risk narrative.
+2) Ignore stale reasons (e.g., FY24 old events) unless a fresh disclosure appears in last 90 days.
+3) Be specific and data-backed, avoid generic filler.
+4) Return ONLY valid JSON, no markdown.
+
+MODE: {mode.upper()}
+STOCK: {symbol} | COMPANY: {company_name} | SECTOR: {sector} | SUB-SECTOR: {sub_sector}
+
+FUNDAMENTALS:
+{_compact_json({
+    "cmp": fundamentals.get("cmp"),
+    "pe_ratio": fundamentals.get("pe_ratio"),
+    "market_cap": fundamentals.get("market_cap"),
+    "revenue_growth_yoy": fundamentals.get("revenue_growth_yoy"),
+    "roe": fundamentals.get("roe"),
+    "roce": fundamentals.get("roce"),
+    "debt_equity": fundamentals.get("debt_equity"),
+    "price_vs_50dma": fundamentals.get("price_vs_50dma"),
+    "price_vs_200dma": fundamentals.get("price_vs_200dma"),
+    "52w_high": fundamentals.get("52w_high"),
+    "52w_low": fundamentals.get("52w_low"),
+    "promoter_holding": fundamentals.get("promoter_holding"),
+    "fii_holding": fundamentals.get("fii_holding"),
+})}
+
+ANNOUNCEMENTS(last 90d): {_compact_json(compact_inputs.get("announcements") or [])}
+BULK DEALS(last 30d): {_compact_json(compact_inputs.get("bulk_deals") or [])}
+INSIDER(last 90d): {_compact_json(compact_inputs.get("insider_trades") or [])}
+NEWS(last 90d): {_compact_json(compact_inputs.get("news_articles") or [])}
+SECTOR NEWS(last 90d): {_compact_json(compact_inputs.get("sector_news") or [])}
+PEERS: {_compact_json(compact_inputs.get("peers") or [])}
+
+Return JSON with exact top-level keys:
+{{
+  "catalyst_analysis": {{
+    "catalyst_type": "INSTITUTIONAL_BUYING|ORDER_WIN|CAPEX|RESULTS_BEAT|BONUS_SPLIT|SECTOR_TAILWIND|INSIDER_BUY|REGULATORY_BENEFIT|MANAGEMENT_UPGRADE|MULTIPLE|OTHER",
+    "catalyst_headline": "string max 12 words",
+    "catalyst_date": "DD-MMM-YYYY or NA",
+    "catalyst_detail": "string max {max_words} words",
+    "supporting_evidence": ["3 concise evidence lines with dates"],
+    "confidence_score": 0,
+    "impact_timeline": "IMMEDIATE|3_MONTHS|6_MONTHS|12_MONTHS",
+    "secondary_catalysts": ["2 short strings"],
+    "data_quality": "HIGH|MEDIUM|LOW"
+  }},
+  "fundamental_analysis": {{
+    "business_description": "string",
+    "revenue_trend": "string",
+    "profitability_trend": "string",
+    "balance_sheet_health": "STRONG|MODERATE|WEAK",
+    "balance_sheet_comment": "string",
+    "shareholding_comment": "string",
+    "promoter_concern": false,
+    "valuation_vs_peers": "CHEAP|FAIR|EXPENSIVE",
+    "valuation_comment": "string",
+    "key_strengths": ["3 strings"],
+    "key_concerns": ["2 strings"],
+    "fundamental_score": 0,
+    "rating": "STRONG_BUY|BUY|HOLD|SELL|STRONG_SELL",
+    "target_price": 0,
+    "upside_pct": 0,
+    "rating_rationale": "string"
+  }},
+  "sector_risk_analysis": {{
+    "sector_cycle_stage": "EARLY_UPCYCLE|MID_UPCYCLE|PEAK|EARLY_DOWNCYCLE|BOTTOM",
+    "sector_outlook": "VERY_BULLISH|BULLISH|NEUTRAL|BEARISH",
+    "sector_tailwinds": ["3 strings"],
+    "government_schemes": ["up to 4 strings"],
+    "global_cues": "string",
+    "top_risks": [
+      {{"risk_title":"string", "risk_detail":"string", "severity":"HIGH|MEDIUM|LOW"}},
+      {{"risk_title":"string", "risk_detail":"string", "severity":"HIGH|MEDIUM|LOW"}},
+      {{"risk_title":"string", "risk_detail":"string", "severity":"HIGH|MEDIUM|LOW"}}
+    ],
+    "investment_horizon": "SHORT_TERM|MEDIUM_TERM|LONG_TERM",
+    "sector_leader_or_laggard": "LEADER|MID|LAGGARD"
+  }}
+}}"""
+
+
+async def run_unified_analysis(
+    symbol: str,
+    company_name: str,
+    sector: str,
+    sub_sector: str,
+    fundamentals: dict,
+    announcements: list[dict],
+    bulk_deals: list[dict],
+    insider_trades: list[dict],
+    news_articles: list[dict],
+    peers: list[dict],
+    sector_news: list[dict],
+    mode: str,
+) -> dict:
+    compact = _compact_inputs_for_model(
+        announcements=announcements,
+        bulk_deals=bulk_deals,
+        insider_trades=insider_trades,
+        news_articles=news_articles,
+        peers=peers,
+        sector_news=sector_news,
+        mode=mode,
+    )
+    prompt = _unified_analysis_prompt(
+        symbol=symbol,
+        company_name=company_name,
+        sector=sector,
+        sub_sector=sub_sector,
+        fundamentals=fundamentals,
+        compact_inputs=compact,
+        mode=mode,
+    )
+    max_out = 900 if mode == "lite" else 1400
+    return await asyncio.to_thread(call_gemini, prompt, max_out, mode)
+
+
 async def run_catalyst_analysis(
     symbol: str,
     company_name: str,
@@ -554,36 +831,36 @@ async def analyze_stock_with_gemini(
     sector_news: list[dict],
 ) -> dict:
     """
-    Run 3 Gemini calls per stock and merge into one unified research result.
-    Calls are intentionally sequential to reduce free-tier rate-limit pressure.
+    Run one unified AI call per stock to reduce token burn and improve free-tier throughput.
     """
-    catalyst = await run_catalyst_analysis(
+    mode = _current_mode()
+
+    ai_blob = await run_unified_analysis(
         symbol=symbol,
         company_name=company_name,
         sector=sector,
+        sub_sector=sub_sector,
         fundamentals=fundamentals,
         announcements=announcements,
         bulk_deals=bulk_deals,
         insider_trades=insider_trades,
         news_articles=news_articles,
-    )
-
-    fundamentals_analysis = await run_fundamental_analysis(
-        symbol=symbol,
-        company_name=company_name,
-        fundamentals=fundamentals,
         peers=peers,
+        sector_news=sector_news,
+        mode=mode,
     )
 
-    sector_risk = await run_sector_risk_analysis(
-        company_name=company_name,
-        sector=sector,
-        sub_sector=sub_sector,
-        sector_news=sector_news,
-    )
+    catalyst = ai_blob.get("catalyst_analysis") if isinstance(ai_blob.get("catalyst_analysis"), dict) else {}
+    fundamentals_analysis = ai_blob.get("fundamental_analysis") if isinstance(ai_blob.get("fundamental_analysis"), dict) else {}
+    sector_risk = ai_blob.get("sector_risk_analysis") if isinstance(ai_blob.get("sector_risk_analysis"), dict) else {}
 
     cmp_value = fundamentals.get("cmp")
     target_default = round(float(cmp_value) * 1.08, 2) if isinstance(cmp_value, (int, float)) else None
+
+    # Guard against stale catalyst dates that violate the 90-day relevance rule.
+    catalyst_date = _parse_any_date((catalyst or {}).get("catalyst_date")) if isinstance(catalyst, dict) else None
+    if catalyst_date is not None and catalyst_date < (datetime.now(timezone.utc) - timedelta(days=90)):
+        catalyst = {}
 
     if not catalyst:
         catalyst = _heuristic_catalyst_fallback(
@@ -604,6 +881,11 @@ async def analyze_stock_with_gemini(
             fundamentals=fundamentals,
             target_default=target_default,
         )
+
+    sector_key = f"{_today_key()}::{(sector or 'UNKNOWN').upper()}::{(sub_sector or 'UNKNOWN').upper()}"
+    cached_sector = _SECTOR_MEMO_CACHE.get(sector_key)
+    if not sector_risk and cached_sector:
+        sector_risk = dict(cached_sector)
 
     if not sector_risk:
         trend = _safe_num(fundamentals.get("price_vs_200dma"))
@@ -649,14 +931,14 @@ async def analyze_stock_with_gemini(
             "sector_leader_or_laggard": "MID",
         }
 
-    ai_source = "heuristic"
-    ai_model = "none"
-    if isinstance(catalyst, dict) and catalyst.get("_ai_source"):
-        ai_source = str(catalyst.get("_ai_source"))
-        ai_model = str(catalyst.get("_ai_model") or "unknown")
-    elif isinstance(fundamentals_analysis, dict) and fundamentals_analysis.get("_ai_source"):
-        ai_source = str(fundamentals_analysis.get("_ai_source"))
-        ai_model = str(fundamentals_analysis.get("_ai_model") or "unknown")
+    if sector_risk:
+        _SECTOR_MEMO_CACHE[sector_key] = dict(sector_risk)
+
+    ai_source = str(ai_blob.get("_ai_source") or "heuristic")
+    ai_model = str(ai_blob.get("_ai_model") or "none")
+    if not ai_blob:
+        ai_source = "heuristic"
+        ai_model = "none"
 
     if isinstance(catalyst, dict):
         catalyst.pop("_ai_source", None)
@@ -689,5 +971,7 @@ async def analyze_stock_with_gemini(
             "source": ai_source,
             "model": ai_model,
             "fallback_used": ai_source == "heuristic",
+            "mode": mode,
+            "budget_remaining_est": max(0, DAILY_TOKEN_BUDGET_EST - int(_AI_BUDGET_STATE.get("reserved_tokens") or 0)),
         },
     }
