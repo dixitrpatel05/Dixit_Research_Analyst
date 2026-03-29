@@ -12,7 +12,7 @@ import pytesseract
 from fastapi import FastAPI, File, Form, HTTPException, Path, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pydantic import BaseModel, Field
 
 from env import get_backend_key, has_backend_key
@@ -137,12 +137,97 @@ def _extract_symbols_from_text(text: str) -> list[str]:
     return out
 
 
+def _prepare_image_variants(image: Image.Image) -> list[Image.Image]:
+    base = image.convert("RGB")
+    w, h = base.size
+
+    variants: list[Image.Image] = [base]
+
+    # Upscale narrow screenshots to improve OCR readability.
+    if w < 1000:
+        scale = max(2, int(1200 / max(w, 1)))
+        upscaled = base.resize((w * scale, h * scale), Image.Resampling.LANCZOS)
+        variants.append(upscaled)
+
+    # Enhance contrast and sharpness for dark-theme watchlist screenshots.
+    contrast = ImageEnhance.Contrast(base).enhance(2.0)
+    sharp = ImageEnhance.Sharpness(contrast).enhance(2.2)
+    variants.append(sharp)
+
+    gray = ImageOps.grayscale(base)
+    boosted = ImageEnhance.Contrast(gray).enhance(2.4)
+    bw = boosted.point(lambda p: 255 if p > 140 else 0, mode="1").convert("RGB")
+    variants.append(bw)
+
+    denoised = base.filter(ImageFilter.MedianFilter(size=3))
+    variants.append(denoised)
+
+    # Deduplicate by dimensions and first bytes to avoid redundant OCR calls.
+    unique: list[Image.Image] = []
+    seen: set[tuple[int, int, bytes]] = set()
+    for v in variants:
+        key = (v.size[0], v.size[1], v.tobytes()[:128])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(v)
+    return unique
+
+
 def _extract_symbols_with_tesseract(image: Image.Image) -> list[str]:
-    try:
-        text = pytesseract.image_to_string(image)
-    except Exception:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    configs = [
+        "--psm 6 --oem 3",
+        "--psm 11 --oem 3",
+        "--psm 4 --oem 3",
+    ]
+
+    for variant in _prepare_image_variants(image):
+        for cfg in configs:
+            try:
+                text = pytesseract.image_to_string(variant, config=cfg)
+            except Exception:
+                continue
+            for sym in _extract_symbols_from_text(text):
+                if sym not in seen:
+                    seen.add(sym)
+                    candidates.append(sym)
+            if len(candidates) >= 8:
+                return candidates
+    return candidates
+
+
+def _extract_symbols_from_model_text(raw: str) -> list[str]:
+    if not raw:
         return []
-    return _extract_symbols_from_text(text)
+
+    cleaned = raw.strip()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    # Try strict JSON first.
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict) and isinstance(parsed.get("symbols"), list):
+            for token in parsed["symbols"]:
+                sym = _normalize_symbol(str(token or ""))
+                if _is_likely_symbol(sym) and sym not in seen:
+                    seen.add(sym)
+                    out.append(sym)
+            if out:
+                return out
+    except Exception:
+        pass
+
+    # Fallback: extract uppercase tokens from free-form model output.
+    for token in re.split(r"[^A-Za-z0-9:]+", cleaned):
+        sym = _normalize_symbol(token)
+        if _is_likely_symbol(sym) and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out
 
 
 def _extract_symbols_with_gemini_vision(image: Image.Image) -> list[str]:
@@ -155,45 +240,36 @@ def _extract_symbols_with_gemini_vision(image: Image.Image) -> list[str]:
 
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = (
-            "Extract only Indian stock ticker symbols visible in this watchlist screenshot. "
-            "Return strict JSON with shape: {\"symbols\": [\"RELIANCE\", \"INFY\"]}. "
-            "Rules: uppercase, symbol only, no NSE/BSE prefixes, no extra text."
-        )
-
-        response = model.generate_content(
-            [prompt, image],
-            generation_config=genai.types.GenerationConfig(
-                temperature=0,
-                response_mime_type="application/json",
+        prompts = [
+            (
+                "You are reading a TradingView watchlist screenshot with columns like Symbol and Last. "
+                "Extract ticker symbols from the Symbol column only. "
+                "Return strict JSON: {\"symbols\": [\"RELIANCE\", \"INFY\"]}. "
+                "Rules: uppercase, max 10 chars, no prices, no bullets, no extra keys."
             ),
-        )
-        raw = (getattr(response, "text", "") or "").strip()
-        if not raw:
-            return []
+            (
+                "List only ticker symbols visible in this watchlist image. "
+                "One symbol per line, uppercase, no explanation, no numbering."
+            ),
+        ]
 
-        parsed: Any
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start == -1 or end == -1 or end <= start:
-                return []
-            parsed = json.loads(raw[start : end + 1])
-
-        symbols_raw = parsed.get("symbols") if isinstance(parsed, dict) else None
-        if not isinstance(symbols_raw, list):
-            return []
-
-        out: list[str] = []
-        seen: set[str] = set()
-        for token in symbols_raw:
-            sym = _normalize_symbol(str(token or ""))
-            if _is_likely_symbol(sym) and sym not in seen:
-                seen.add(sym)
-                out.append(sym)
-        return out
+        best: list[str] = []
+        for variant in _prepare_image_variants(image)[:3]:
+            for idx, prompt in enumerate(prompts):
+                response = model.generate_content(
+                    [prompt, variant],
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0,
+                        response_mime_type="application/json" if idx == 0 else "text/plain",
+                    ),
+                )
+                raw = (getattr(response, "text", "") or "").strip()
+                symbols = _extract_symbols_from_model_text(raw)
+                if len(symbols) > len(best):
+                    best = symbols
+                if len(best) >= 5:
+                    return best
+        return best
     except Exception:
         return []
 
