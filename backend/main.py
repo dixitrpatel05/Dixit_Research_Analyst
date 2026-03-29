@@ -137,6 +137,81 @@ def _extract_symbols_from_text(text: str) -> list[str]:
     return out
 
 
+def _extract_symbols_with_tesseract(image: Image.Image) -> list[str]:
+    try:
+        text = pytesseract.image_to_string(image)
+    except Exception:
+        return []
+    return _extract_symbols_from_text(text)
+
+
+def _extract_symbols_with_gemini_vision(image: Image.Image) -> list[str]:
+    api_key = get_backend_key("gemini")
+    if not api_key:
+        return []
+
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = (
+            "Extract only Indian stock ticker symbols visible in this watchlist screenshot. "
+            "Return strict JSON with shape: {\"symbols\": [\"RELIANCE\", \"INFY\"]}. "
+            "Rules: uppercase, symbol only, no NSE/BSE prefixes, no extra text."
+        )
+
+        response = model.generate_content(
+            [prompt, image],
+            generation_config=genai.types.GenerationConfig(
+                temperature=0,
+                response_mime_type="application/json",
+            ),
+        )
+        raw = (getattr(response, "text", "") or "").strip()
+        if not raw:
+            return []
+
+        parsed: Any
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                return []
+            parsed = json.loads(raw[start : end + 1])
+
+        symbols_raw = parsed.get("symbols") if isinstance(parsed, dict) else None
+        if not isinstance(symbols_raw, list):
+            return []
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for token in symbols_raw:
+            sym = _normalize_symbol(str(token or ""))
+            if _is_likely_symbol(sym) and sym not in seen:
+                seen.add(sym)
+                out.append(sym)
+        return out
+    except Exception:
+        return []
+
+
+def _extract_symbols_from_image_bytes(content: bytes) -> list[str]:
+    try:
+        image = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception:
+        return []
+
+    symbols = _extract_symbols_with_tesseract(image)
+    if symbols:
+        return symbols
+
+    # Fallback OCR path for environments where Tesseract binary is unavailable.
+    return _extract_symbols_with_gemini_vision(image)
+
+
 def _parse_manual_symbols(manual_symbols: str | None) -> list[str]:
     if not manual_symbols:
         return []
@@ -361,9 +436,8 @@ async def ocr_extract_symbols(
     if file is not None:
         try:
             content = await file.read()
-            image = Image.open(io.BytesIO(content))
-            text = pytesseract.image_to_string(image)
-            symbols.extend(_extract_symbols_from_text(text))
+            ocr_symbols = await asyncio.to_thread(_extract_symbols_from_image_bytes, content)
+            symbols.extend(ocr_symbols)
         except Exception:
             # Do not fail if OCR fails; manual input can still proceed.
             pass
