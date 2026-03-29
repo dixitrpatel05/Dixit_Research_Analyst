@@ -64,6 +64,144 @@ def _compact_json(payload: Any) -> str:
         return "{}"
 
 
+def _safe_num(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _heuristic_catalyst_fallback(
+    symbol: str,
+    company_name: str,
+    sector: str,
+    fundamentals: dict,
+    announcements: list[dict],
+    bulk_deals: list[dict],
+    insider_trades: list[dict],
+    news_articles: list[dict],
+) -> dict:
+    catalyst_type = "SECTOR_TAILWIND"
+    headline = "Momentum supported by sector and liquidity"
+    evidence: list[str] = []
+
+    if bulk_deals:
+        catalyst_type = "INSTITUTIONAL_BUYING"
+        headline = "Bulk activity indicates institutional participation"
+        evidence.append(f"{len(bulk_deals)} bulk/block deal records detected in recent window")
+    if insider_trades:
+        catalyst_type = "INSIDER_BUY"
+        headline = "Insider activity signaling management confidence"
+        evidence.append(f"{len(insider_trades)} insider-trade records were available")
+    if announcements:
+        top = str((announcements[0] or {}).get("type") or "OTHER").upper()
+        if top in {"ORDER_WIN", "CAPEX", "RESULTS", "BUYBACK", "BONUS"}:
+            catalyst_type = top if top != "RESULTS" else "RESULTS_BEAT"
+            headline = f"Recent {top.replace('_', ' ').title()} disclosure supporting rerating"
+        evidence.append(f"{len(announcements)} corporate announcements available in last 90 days")
+    if news_articles:
+        evidence.append(f"{len(news_articles)} relevant news references captured")
+
+    vs_200dma = _safe_num(fundamentals.get("price_vs_200dma"))
+    rev_growth = _safe_num(fundamentals.get("revenue_growth_yoy"))
+    roe = _safe_num(fundamentals.get("roe"))
+    debt_equity = _safe_num(fundamentals.get("debt_equity"))
+
+    confidence = 42
+    if vs_200dma is not None:
+        confidence += 8 if vs_200dma > 5 else 3 if vs_200dma > 0 else -2
+    if rev_growth is not None:
+        confidence += 8 if rev_growth > 15 else 4 if rev_growth > 5 else -3
+    if roe is not None:
+        confidence += 8 if roe > 15 else 3 if roe > 10 else -2
+    if debt_equity is not None:
+        confidence += 5 if debt_equity < 0.7 else 1 if debt_equity < 1.5 else -4
+    confidence += min(10, len(news_articles)) // 2
+    confidence += min(8, len(announcements)) // 2
+    confidence += min(6, len(bulk_deals))
+    confidence = max(35, min(82, int(confidence)))
+
+    data_points = [announcements, bulk_deals, insider_trades, news_articles]
+    non_empty = sum(1 for p in data_points if p)
+    quality = "HIGH" if non_empty >= 3 else "MEDIUM" if non_empty >= 2 else "LOW"
+
+    detail = (
+        f"AI catalyst model was unavailable, so fallback heuristics were used for {company_name} ({symbol}). "
+        f"The assessment blends trend data (price vs 200DMA: {vs_200dma if vs_200dma is not None else 'NA'}%), "
+        f"fundamental momentum (revenue growth: {rev_growth if rev_growth is not None else 'NA'}%), and event flow across "
+        f"announcements, news, and deal activity. Sector context for {sector or 'the sector'} remains a secondary support, "
+        "while confidence is calibrated lower than full-model output to reflect reduced narrative certainty."
+    )
+
+    evidence = evidence[:3] or [
+        "Fallback heuristic mode active due to unavailable AI response",
+        "Market and disclosure data were used as confidence anchors",
+        "Re-run may produce richer catalyst narrative when model is available",
+    ]
+
+    return {
+        "catalyst_type": catalyst_type,
+        "catalyst_headline": headline,
+        "catalyst_date": "NA",
+        "catalyst_detail": detail,
+        "supporting_evidence": evidence,
+        "confidence_score": confidence,
+        "impact_timeline": "3_MONTHS" if confidence >= 50 else "IMMEDIATE",
+        "secondary_catalysts": ["Liquidity trend", "Sector sentiment"],
+        "data_quality": quality,
+    }
+
+
+def _heuristic_fundamental_fallback(company_name: str, sector: str, fundamentals: dict, target_default: float | None) -> dict:
+    rev_growth = _safe_num(fundamentals.get("revenue_growth_yoy"))
+    roe = _safe_num(fundamentals.get("roe"))
+    debt_equity = _safe_num(fundamentals.get("debt_equity"))
+    pe = _safe_num(fundamentals.get("pe_ratio"))
+
+    score = 50
+    if rev_growth is not None:
+        score += 12 if rev_growth > 15 else 7 if rev_growth > 8 else 2 if rev_growth > 0 else -6
+    if roe is not None:
+        score += 12 if roe > 18 else 7 if roe > 12 else 3 if roe > 8 else -5
+    if debt_equity is not None:
+        score += 8 if debt_equity < 0.5 else 4 if debt_equity < 1 else -6
+    if pe is not None:
+        score += -2 if pe > 45 else 2 if pe < 25 else 0
+    score = max(35, min(84, int(score)))
+
+    if score >= 75:
+        rating = "STRONG_BUY"
+    elif score >= 66:
+        rating = "BUY"
+    elif score >= 52:
+        rating = "HOLD"
+    elif score >= 43:
+        rating = "SELL"
+    else:
+        rating = "STRONG_SELL"
+
+    return {
+        "business_description": f"{company_name} operates in {sector or 'its'} sector and was assessed using quantitative fallback scoring.",
+        "revenue_trend": f"Revenue growth proxy is {rev_growth:.2f}% yoy." if rev_growth is not None else "Revenue trend could not be inferred.",
+        "profitability_trend": f"ROE proxy is {roe:.2f}%." if roe is not None else "Profitability trend could not be inferred.",
+        "balance_sheet_health": "STRONG" if (debt_equity is not None and debt_equity < 0.6) else "MODERATE" if (debt_equity is not None and debt_equity < 1.5) else "WEAK",
+        "balance_sheet_comment": "Fallback assessment based on debt-equity and profitability proxies.",
+        "shareholding_comment": "Detailed shareholding trend classification unavailable in fallback mode.",
+        "promoter_concern": False,
+        "valuation_vs_peers": "CHEAP" if (pe is not None and pe < 18) else "EXPENSIVE" if (pe is not None and pe > 40) else "FAIR",
+        "valuation_comment": "Relative valuation estimated from available PE snapshot.",
+        "key_strengths": ["Quantitative momentum", "Financial quality indicators", "Sector participation"],
+        "key_concerns": ["Model fallback mode", "Limited narrative certainty"],
+        "fundamental_score": score,
+        "rating": rating,
+        "target_price": target_default,
+        "upside_pct": 8.0 if target_default is not None else None,
+        "rating_rationale": "Fallback rating is now computed from revenue growth, ROE, leverage, and valuation proxies instead of static defaults.",
+    }
+
+
 def _catalyst_prompt(
     symbol: str,
     company_name: str,
@@ -270,41 +408,24 @@ async def analyze_stock_with_gemini(
     target_default = round(float(cmp_value) * 1.08, 2) if isinstance(cmp_value, (int, float)) else None
 
     if not catalyst:
-        catalyst = {
-            "catalyst_type": "SECTOR_TAILWIND",
-            "catalyst_headline": "Momentum supported by sector and liquidity",
-            "catalyst_date": "NA",
-            "catalyst_detail": "Catalyst inference is temporarily running in fallback mode because AI response was unavailable. Data signals from price, volume, and news flow were used to generate a conservative baseline interpretation.",
-            "supporting_evidence": [
-                "Recent market activity indicates above-baseline attention for the symbol",
-                "Multiple recent public news mentions were detected",
-                "Fundamental data snapshot was available for scoring context",
-            ],
-            "confidence_score": 55,
-            "impact_timeline": "3_MONTHS",
-            "secondary_catalysts": ["Macro liquidity", "Sector sentiment"],
-            "data_quality": "MEDIUM",
-        }
+        catalyst = _heuristic_catalyst_fallback(
+            symbol=symbol,
+            company_name=company_name,
+            sector=sector,
+            fundamentals=fundamentals,
+            announcements=announcements,
+            bulk_deals=bulk_deals,
+            insider_trades=insider_trades,
+            news_articles=news_articles,
+        )
 
     if not fundamentals_analysis:
-        fundamentals_analysis = {
-            "business_description": f"{company_name} operates in {sector} and is being evaluated with fallback scoring.",
-            "revenue_trend": "Revenue trend could not be AI-classified in this run.",
-            "profitability_trend": "Profitability trend could not be AI-classified in this run.",
-            "balance_sheet_health": "MODERATE",
-            "balance_sheet_comment": "Fallback assessment due to unavailable AI response.",
-            "shareholding_comment": "Shareholding interpretation unavailable from AI in this run.",
-            "promoter_concern": False,
-            "valuation_vs_peers": "FAIR",
-            "valuation_comment": "Valuation marked FAIR in fallback mode.",
-            "key_strengths": ["Scale", "Diversification", "Market relevance"],
-            "key_concerns": ["Execution variability", "Macro sensitivity"],
-            "fundamental_score": 60,
-            "rating": "HOLD",
-            "target_price": target_default,
-            "upside_pct": 8.0 if target_default is not None else None,
-            "rating_rationale": "Fallback rating generated because AI response was unavailable. Re-run later for full model-driven narrative.",
-        }
+        fundamentals_analysis = _heuristic_fundamental_fallback(
+            company_name=company_name,
+            sector=sector,
+            fundamentals=fundamentals,
+            target_default=target_default,
+        )
 
     if not sector_risk:
         sector_risk = {

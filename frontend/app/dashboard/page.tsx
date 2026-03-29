@@ -45,6 +45,7 @@ export default function DashboardPage() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [pdfLoadingMap, setPdfLoadingMap] = useState<Record<string, boolean>>({});
+  const [pdfErrorMessage, setPdfErrorMessage] = useState("");
   const [isDarkSurface, setIsDarkSurface] = useState(true);
 
   const stocks = useMemo(
@@ -219,10 +220,20 @@ export default function DashboardPage() {
   }, [filters.rating, router, setFilter, symbols]);
 
   const handleDownloadPdf = async (symbol: string) => {
+    setPdfErrorMessage("");
     setPdfLoadingMap((prev) => ({ ...prev, [symbol]: true }));
     try {
       const response = await apiFetch(`/report/${symbol}/pdf`);
-      if (!response.ok) throw new Error("PDF download failed");
+      if (!response.ok) {
+        let detail = "";
+        try {
+          const maybe = (await response.json()) as { detail?: string; error?: string };
+          detail = maybe.detail || maybe.error || "";
+        } catch {
+          detail = "";
+        }
+        throw new Error(detail || `HTTP ${response.status}`);
+      }
 
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
@@ -233,8 +244,9 @@ export default function DashboardPage() {
       anchor.click();
       anchor.remove();
       window.URL.revokeObjectURL(url);
-    } catch {
-      // Silent fail in UI for now.
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown PDF error";
+      setPdfErrorMessage(`PDF failed for ${symbol}: ${detail}`);
     } finally {
       setPdfLoadingMap((prev) => ({ ...prev, [symbol]: false }));
     }
@@ -243,7 +255,7 @@ export default function DashboardPage() {
   return (
     <main className={cx("h-screen overflow-hidden", isDarkSurface ? "bg-[#0A0A0F] text-white" : "bg-[#F6F7FB] text-[#0B1220]")}>
       <header className="fixed inset-x-0 top-0 z-40 border-b border-white/10 bg-[rgba(10,10,15,0.8)] backdrop-blur-[20px]">
-        <div className="mx-auto flex h-16 max-w-[1400px] items-center justify-between px-4">
+        <div className="mx-auto flex h-16 w-full max-w-[1960px] items-center justify-between px-4 xl:px-8">
           <div>
             <div className="text-[18px] font-bold tracking-[-0.02em]">AlphaDesk</div>
             <div className="text-[12px] text-gray-400">Research Terminal</div>
@@ -298,7 +310,7 @@ export default function DashboardPage() {
         </div>
       </header>
 
-      <div className="mx-auto flex h-full max-w-[1400px] flex-col px-4 pb-4 pt-20">
+      <div className="mx-auto flex h-full w-full max-w-[1960px] flex-col px-4 pb-4 pt-20 xl:px-8">
         <section className="grid grid-cols-1 gap-3 md:grid-cols-4">
           <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
             <div className="text-xs text-gray-400">Total Stocks Analyzed</div>
@@ -326,7 +338,7 @@ export default function DashboardPage() {
           </div>
         </section>
 
-        <section className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+        <section className="mt-4 min-h-0 flex-1 overflow-y-auto overflow-x-hidden pr-1">
           {!symbols.length ? (
             <div className="flex h-full items-center justify-center rounded-2xl border border-dashed border-white/10 bg-white/[0.02] p-8 text-center">
               <div>
@@ -364,6 +376,12 @@ export default function DashboardPage() {
       {isStreaming || isRefreshing ? (
         <div className="pointer-events-none fixed bottom-4 right-4 z-50 rounded-xl border border-white/10 bg-black/60 p-3 text-xs text-gray-200 backdrop-blur-xl">
           {isRefreshing ? "Refreshing all stocks..." : "Streaming research updates..."}
+        </div>
+      ) : null}
+
+      {pdfErrorMessage ? (
+        <div className="fixed bottom-4 left-4 z-50 rounded-xl border border-red-400/30 bg-red-950/75 px-4 py-3 text-xs text-red-100 backdrop-blur-xl">
+          {pdfErrorMessage}
         </div>
       ) : null}
     </main>

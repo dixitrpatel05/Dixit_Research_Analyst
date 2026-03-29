@@ -590,7 +590,10 @@ async def research_symbol(symbol: str = Path(..., min_length=2, max_length=15)) 
 @app.get("/api/report/{symbol}/pdf")
 async def get_report_pdf(symbol: str = Path(..., min_length=2, max_length=15)) -> StreamingResponse:
     result = await run_research_pipeline(symbol)
-    pdf_bytes = generate_pdf_bytes(result)
+    try:
+        pdf_bytes = generate_pdf_bytes(result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}") from exc
 
     filename = f"{_normalize_symbol(symbol)}_alphadesk_report.pdf"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}

@@ -158,7 +158,8 @@ export default function StockRow({
     >
       <div
         className={clsx(
-          "grid items-center gap-3 p-3 md:grid-cols-[20%_25%_15%_20%_12%_8%]",
+          "grid items-center gap-3 p-3 xl:grid-cols-[1.2fr_1.7fr_0.8fr_1.3fr_0.9fr_auto]",
+          "lg:grid-cols-[1fr_1.3fr_0.8fr_1.1fr]",
           "grid-cols-1",
           loadingState === "loading" && "opacity-70",
         )}

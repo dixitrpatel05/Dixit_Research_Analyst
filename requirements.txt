@@ -11,6 +11,7 @@ nsetools
 beautifulsoup4
 lxml
 weasyprint
+reportlab
 aiofiles
 tavily-python
 pandas

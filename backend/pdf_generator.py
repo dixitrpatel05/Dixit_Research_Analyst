@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from datetime import datetime
 from html import escape
 from typing import Any
@@ -8,6 +9,15 @@ try:
   from weasyprint import HTML
 except Exception:
   HTML = None
+
+try:
+  from reportlab.lib.pagesizes import A4
+  from reportlab.lib.utils import simpleSplit
+  from reportlab.pdfgen import canvas
+except Exception:
+  A4 = None
+  canvas = None
+  simpleSplit = None
 
 
 def _inr(value: Any) -> str:
@@ -453,17 +463,69 @@ def generate_report_html(report: dict) -> str:
 
 
 def generate_pdf_bytes(report: dict) -> bytes:
-  if HTML is None:
-    raise RuntimeError("PDF engine unavailable: WeasyPrint dependencies are missing in runtime environment.")
-
+  if HTML is not None:
     html = generate_report_html(report)
     return HTML(string=html).write_pdf()
 
+  if canvas is None or A4 is None or simpleSplit is None:
+    raise RuntimeError("PDF engine unavailable: install WeasyPrint dependencies or include reportlab fallback.")
+
+  # Lightweight fallback PDF renderer for environments missing WeasyPrint system libs.
+  buffer = io.BytesIO()
+  c = canvas.Canvas(buffer, pagesize=A4)
+  width, height = A4
+  y = height - 50
+
+  def write_line(text: str, size: int = 10, gap: int = 14) -> None:
+    nonlocal y
+    if y < 60:
+      c.showPage()
+      y = height - 50
+    c.setFont("Helvetica", size)
+    c.drawString(40, y, text[:180])
+    y -= gap
+
+  symbol = str(report.get("symbol") or "UNKNOWN")
+  company = str(report.get("company_name") or symbol)
+  fundamentals = report.get("fundamentals") or {}
+  catalyst = report.get("catalyst_analysis") or {}
+  fa = report.get("fundamental_analysis") or {}
+
+  write_line("AlphaDesk Research Report", 15, 20)
+  write_line(f"Company: {company} ({symbol})", 11)
+  write_line(f"Generated: {datetime.utcnow().strftime('%d-%b-%Y %H:%M UTC')}", 9, 18)
+
+  write_line("Summary", 12, 16)
+  write_line(f"Rating: {fa.get('rating') or 'HOLD'} | Confidence: {catalyst.get('confidence_score') or 'NA'}%")
+  write_line(f"CMP: {_inr(fundamentals.get('cmp'))} | Target: {_inr(fa.get('target_price'))} | Upside: {_pct(fa.get('upside_pct'))}")
+
+  write_line("Catalyst", 12, 16)
+  headline = str(catalyst.get("catalyst_headline") or "No primary catalyst identified")
+  for line in simpleSplit(headline, "Helvetica", 10, width - 80):
+    write_line(line)
+
+  detail = str(catalyst.get("catalyst_detail") or "Catalyst narrative unavailable.")
+  for line in simpleSplit(detail, "Helvetica", 9, width - 80)[:25]:
+    write_line(line, 9, 12)
+
+  write_line("Fundamentals", 12, 16)
+  write_line(f"PE: {_num(fundamentals.get('pe_ratio'), 2)} | ROE: {_pct(fundamentals.get('roe'))} | D/E: {_num(fundamentals.get('debt_equity'), 2)}")
+
+  rationale = str(fa.get("rating_rationale") or "Rationale unavailable in fallback mode.")
+  for line in simpleSplit(rationale, "Helvetica", 9, width - 80)[:20]:
+    write_line(line, 9, 12)
+
+  c.save()
+  return buffer.getvalue()
+
 
 def generate_pdf_file(report: dict, output_path: str) -> str:
-  if HTML is None:
-    raise RuntimeError("PDF engine unavailable: WeasyPrint dependencies are missing in runtime environment.")
-
+  if HTML is not None:
     html = generate_report_html(report)
     HTML(string=html).write_pdf(target=output_path)
     return output_path
+
+  pdf_bytes = generate_pdf_bytes(report)
+  with open(output_path, "wb") as f:
+    f.write(pdf_bytes)
+  return output_path
